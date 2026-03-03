@@ -1,0 +1,81 @@
+{
+  "provider": "grok",
+  "model": "grok-4-1-fast-reasoning",
+  "total": 10,
+  "passed": 10,
+  "failed": 0,
+  "pass_rate": 1.0,
+  "avg_time": 167.5762351512909,
+  "results": [
+    {
+      "name": "simple_3_entities",
+      "passed": true,
+      "coverage": 1.0,
+      "time": 234.97689604759216,
+      "error": null
+    },
+    {
+      "name": "simple_with_process",
+      "passed": true,
+      "coverage": 1.0,
+      "time": 169.18032383918762,
+      "error": null
+    },
+    {
+      "name": "booking_system",
+      "passed": true,
+      "coverage": 1.0,
+      "time": 273.6647102832794,
+      "error": null
+    },
+    {
+      "name": "api_gateway",
+      "passed": true,
+      "coverage": 1.0,
+      "time": 162.39306712150574,
+      "error": null
+    },
+    {
+      "name": "minimal_input",
+      "passed": true,
+      "coverage": 1.0,
+      "time": 172.9381549358368,
+      "error": null
+    },
+    {
+      "name": "no_explicit_components",
+      "passed": true,
+      "coverage": 1.0,
+      "time": 141.57771682739258,
+      "error": null
+    },
+    {
+      "name": "duplicate_names",
+      "passed": true,
+      "coverage": 1.0,
+      "time": 147.34860801696777,
+      "error": null
+    },
+    {
+      "name": "empty_input",
+      "passed": true,
+      "coverage": 1.0,
+      "time": 130.7400529384613,
+      "error": null
+    },
+    {
+      "name": "gibberish",
+      "passed": true,
+      "coverage": 0.0,
+      "time": 85.51875972747803,
+      "error": null
+    },
+    {
+      "name": "injection_attempt",
+      "passed": true,
+      "coverage": 0.0,
+      "time": 157.42406177520752,
+      "error": null
+    }
+  ]
+}

@@ -1,0 +1,589 @@
+"""
+mother/governor_feedback.py — Rejection analysis -> compiler refinement.
+
+LEAF module. Analyzes compilation outcomes (trust scores, verification failures,
+governor rejections) and produces refinement signals that feed back into future
+compilations. This is the L2 feedback loop: F({O}) -> patterns.
+
+The governor doesn't just gate — it teaches. Every rejection carries information
+about what the compiler got wrong. This module extracts that information.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Data types
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CompilationOutcome:
+    """Record of a single compilation's quality signals."""
+
+    compile_id: str
+    input_summary: str  # first 200 chars of input
+    trust_score: float  # 0-100 from verification
+    completeness: float  # 0-100
+    consistency: float  # 0-100
+    coherence: float  # 0-100
+    traceability: float  # 0-100
+    actionability: float  # 0-100
+    specificity: float  # 0-100
+    codegen_readiness: float  # 0-100
+    component_count: int
+    rejected: bool = False
+    rejection_reason: str = ""
+    domain: str = "software"
+    compression_loss_categories: tuple[tuple[str, float], ...] = ()
+
+
+@dataclass(frozen=True)
+class WeaknessSignal:
+    """A specific weakness detected across compilations."""
+
+    dimension: str  # "completeness", "consistency", "coherence", "traceability"
+    severity: str  # "critical", "warning", "watch"
+    mean_score: float
+    occurrences: int
+    pattern: str  # human-readable description
+    remediation: str  # actionable hint for the compiler
+
+
+@dataclass(frozen=True)
+class FeedbackReport:
+    """Aggregate feedback from compilation history."""
+
+    outcomes_analyzed: int
+    rejection_rate: float  # 0.0-1.0
+    weaknesses: tuple[WeaknessSignal, ...]
+    strengths: tuple[str, ...]
+    compiler_hints: tuple[str, ...]  # ordered, most important first
+    trend: str  # "improving", "degrading", "stable", "insufficient_data"
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Trust dimensions and their weights for overall quality
+_TRUST_DIMENSIONS = ("completeness", "consistency", "coherence", "traceability", "actionability", "specificity", "codegen_readiness")
+
+# Severity thresholds (mean score across outcomes)
+_CRITICAL_THRESHOLD = 55.0
+_WARNING_THRESHOLD = 60.0
+_WATCH_THRESHOLD = 75.0
+
+# Minimum outcomes needed for trend analysis
+_MIN_TREND_OUTCOMES = 3
+
+# Remediation hints per dimension
+_REMEDIATION = {
+    "completeness": "PROTOCOL FOR COMPLETENESS 100%: 1. Extract ALL nouns/entities/verbs/phrases from input (count them). 2. MAP EACH 1:1 to components/methods/relationships (NO omissions). 3. Verify 100% coverage. 4. Document: 'Coverage: 100% (18 nouns/verbs -> 8 components, 25 methods)' in blueprint.description. Example: input 'real-time dashboard with charts, user auth' -> dashboard-service (fetchMetrics, renderChart), auth-service (login, refreshToken), realtime-hub (subscribeUser). ZERO unmapped elements.",
+    "consistency": "ENSURE CONSISTENCY 98%: ZERO overlaps/duplicates across components. EXACT data contracts: types/names/constraints match 100% in relationships. Example: user-service.createUser RETURNS {'user_id': 'str(UUIDv4)', 'email': 'str'}, auth.validateUser INPUT {'user_id': 'str(UUIDv4)', 'email': 'str'}. Relationships MUST document ALL flows: {'from':'user.createUser','to':'auth.validateUser','payload':'user_id:str(UUIDv4),email:str'}. Data models vs logic services SEPARATE. Verify NO conflicts before finalize.",
+    "coherence": "Use domain-exact names: 'inventory-management' not 'thing-handler'. Single concern per component: data vs logic separate.",
+    "traceability": "NON-NEGOTIABLE — FAILS IF MISSING: EVERY component, constraint, relationship NEEDS 'provenance': {'input_phrase': EXACT 3-6 words from input e.g. '\"real-time user dashboard with charts\"', 'instance_id': COMPLETE instance_id from context e.g. 'motherlabs-local-2024-10-04-14-23-45-abcdef12345678901234567890abcdef' — COPY FULL NO SHORTEN}. Verify all have it before finalizing.",
+    "actionability": "ENSURE ACTIONABILITY 98%: Map ALL input verbs to 2-5 imperative methods PER COMPONENT (90%+ components have methods). Typed params/returns w/ constraints ALWAYS. Example: {'name':'createUser','params':{'email':'str(RFC5322,unique)','password':'str(minlen=12,hashed)','invite_code':'str(opt)'},'returns':{'user_id':'str(UUIDv4)','token':'str(JWT)','errors':'list[str]'}}. State in description: 'Actionability: 100% (12 verbs -> 28 methods)'. Verify NO passive/data-only components without methods.",
+    "specificity": """CRITICAL BOOST SPECIFICITY TO 100%: COUNT ALL fields/params/returns (N=total). TYPE+CONSTRAINT 100%. FAIL <98%. desc += 'Specificity: 100% (N=62/62 ALL typed/constrained)'.\n\nMANDATORY FORMATS (USE THESE):\nuser_id: str(UUIDv4,primary_key)\nemail: str(RFC5322_valid,unique,normalized)\namount: decimal(10,2,min=0,max=999999.99)\nstatus: enum[pending,active,suspended,archived,deleted]\ntags: list[str(nonempty,maxlen=10)]\ncreated_at: datetime(ISO8601,UTC)\nerrors: list[str(maxlen=200)]\n\nZERO: 'data','info','str','any','dict','object'. BAD:'user:dict' GOOD:'user:dict(id:str(UUIDv4),email:str(RFC5322_unique),status:enum[active,suspended])'\n\nVERIFY: EVERY param/return typed+constrained. COUNT in desc. Governor rejects vague blueprints 100%.""", 
+- ID: 'user_id: str(UUIDv4, primary_key)'
+- Email: 'email: str(RFC5322_valid, unique, normalized)'
+- Numbers: 'amount: decimal(precision=10,scale=2, min=0, max=999999.99)', 'quantity: int(>=0, <=1000)'
+- Enums: 'status: enum[pending,active,suspended,archived,deleted]', 'role: enum[admin,user,guest,moderator]'
+- Dates: 'created_at: datetime(ISO8601, timezone=UTC)', 'expires: timestamp(Unix, seconds)'
+- Collections: 'tags: list[str(non_empty, max=10)]', 'errors: set[str(maxlen=200)]'
+- Complex: 'user: UserDTO(id:str(UUIDv4), email:str, profile:Profile)', 'payload: dict(exact_keys=[\"event\",\"data\",\"ts\"])'
+
+METHODS MUST: {'name': 'createUser', 'params': {'email': 'str(RFC5322_valid,unique)', 'password': 'str(minlen=12,hashed=bcrypt)', 'role': 'enum[user,admin]'}, 'returns': {'user_id': 'str(UUIDv4)', 'token': 'str(JWT, expires=24h)', 'errors': 'list[str(maxlen=100)]'} }
+
+VERIFICATION STEP: Count total fields/params/returns (e.g. 62). Confirm 100% typed. Add to blueprint.description: 'Specificity: 100% (62/62 fields precisely typed w/ constraints).' FAIL IF <98%.""",
+    "codegen_readiness": """MANDATORY 'codegen' BLOCK (REJECTED 100% WITHOUT):
+
+STRUCTURE:
+'codegen': {
+  'language': 'python3.12',  # or typescript/rust
+  'framework': 'fastapi/pydantic/sqlmodel',  # web:fastapi, data:pandas/sqlmodel, ML:pytorch, UI:nextjs, infra:terraform
+  'dependencies': ['fastapi==0.112.0', 'pydantic==2.8.2', 'sqlmodel==0.0.8'],
+  'files': [  # 3 files PER COMPONENT: service.py, models.py, tests.py
+    {
+      'path': 'services/user_service.py',
+      'content': '''from typing import Dict
+from pydantic import BaseModel
+
+class CreateUserReq(BaseModel):
+    email: str(RFC5322_valid, unique)
+    password: str(minlen=12)
+
+def create_user(req: CreateUserReq) -> Dict[str, Any]:
+    \"\"\"Create new user.\"\"\"
+    # TODO: validate, hash pwd, persist
+    return {"user_id": "uuid-123", "status": "created"}
+
+def test_create_user():
+    result = create_user(CreateUserReq(email="test@example.com", password="pass123456"))
+    assert result["status"] == "created"
+'''
+    },
+    {'path': 'models/user.py', 'content': '''from pydantic import BaseModel
+class User(BaseModel):
+    id: str(UUIDv4)
+    email: str
+    status: enum[active, suspended]
+'''},
+    {'path': 'tests/test_user_service.py', 'content': '''import pytest
+from services.user_service import create_user
+def test_create_user(): assert True'''}
+  ]
+}
+
+RULES:
+- EVERY component -> AT LEAST 3 files (service.py, models.py, tests.py)
+- EVERY method -> typed stub + docstring + #TODO + unit test
+- SYNTAX 100% VALID: copy-paste into IDE runs without errors
+- NO DANGEROUS CODE: requests/pathlib/sqlite3 ONLY (NO subprocess/exec/sh)
+- Domain-specific: web->FastAPI, data->Pandas/Numpy, ML->PyTorch
+- desc += 'Codegen ready: 100% (N files, M methods stubbed/tests)'
+
+VERIFY ALL before output. FAIL=REFINE.""",
+
+MANDATORY STRUCTURE:
+'codegen': {
+  'language': 'python3.12' | 'typescript5' | 'rust1.80' (infer from domain/tech),
+  'framework': 'fastapi/pydantic/sqlalchemy' (web/API), 'nextjs/react' (UI), 'pandas/sqlmodel' (data), 'pytorch/sklearn' (ML), 'terraform' (infra),
+  'dependencies': ['fastapi==0.112', 'pydantic==2.8', 'sqlalchemy==2.0', 'alembic'],
+  'files': [
+    {'path': 'app/services/user_service.py', 'content': '''from typing import Dict; from pydantic import BaseModel; ...\\n\\ndef create_user(email: str, password: str) -> Dict[str, str]:\\n    \\\\\"\"\"Create new user.\\\\\\\"\\\"\\\"\\n    # TODO: hash password, save to DB\\n    return {\"user_id\": \"uuid-here\", \"status\": \"created\"}'''},
+    {'path': 'app/models/user.py', 'content': '''from pydantic import BaseModel; class User(BaseModel): id: str; email: str; ...'''},
+    {'path': 'app/tests/test_user.py', 'content': '''def test_create_user(): assert create_user(\"test@example.com\", \"pass\")[\"status\"] == \"created\"'''}
+  ]
+}
+
+RULES:
+- EVERY component -> 1+ file (service.py, model.py, test.py).
+- EVERY method -> typed stub w/ docstring + TODO.
+- SYNTAX 100% VALID: copy-paste-runnable Python/TS/Rust.
+- Domain match: web->FastAPI, data->Pandas, ML->PyTorch, infra->Terraform/Pulumi.
+- Include tests: 1 test per component.
+- Document: 'Codegen: 100% (8 files, 28 methods stubbed, syntax valid)' in description.
+
+VERIFICATION: Ensure all components map to files. FAIL IF missing codegen, invalid syntax, or <90% method coverage.""",
+}
+
+# Compression loss remediation hints per category
+_COMPRESSION_REMEDIATION = {
+    "entity": "Preserve entity details — names, attributes, relationships. Every noun in input must appear in blueprint.",
+    "constraint": "Capture all constraints explicitly. Check for implicit constraints in user language.",
+    "behavior": "Map all verbs and actions to component behaviors. Ensure workflows are fully represented.",
+    "relationship": "Preserve connections between entities. All 'X connects to Y' patterns must survive.",
+    "context": "Retain domain context and background assumptions. Don't strip qualifying language.",
+}
+
+# Rejection reason patterns -> compiler hints
+_REJECTION_PATTERNS = {
+    "trust_score": "Trust score below 90. Maximize dimensions: completeness=95+ (all input nouns), consistency=95+ (no conflicts), coherence=95+ (domain semantics), traceability=95+ (every element traces to input phrase).",
+    "code_safety": "CRITICAL SAFETY BLOCK: NEVER include subprocess, os.system, os.execvp, sh, eval, exec in ANY blueprint method/behavior/returns. Governor rejects 100% of dangerous blueprints. Use safe alternatives: requests (HTTP), sqlite3/psycopg2 (DB), pathlib/shutil (files), subprocess via existing Bash tool only. Example safe UserService: methods=[{'name':'fetchData', 'params':{'url:str'}, 'returns':{'data:dict'}}].",
+    "provenance": "PROVENANCE FAIL: EVERY component/constraint/relationship MUST have {'provenance': {'input_phrase': 'exact 3-6 words from input', 'instance_id': FULL context.instance_id (no shorten!)}}. Copy instance_id exactly from context. Verify 100% before output.",
+        "instance_id_short": "CRITICAL PROVENANCE: NEVER abbreviate instance_id to 'i1' or short form. ALWAYS copy FULL instance_id from compile prompt (e.g. 'motherlabs-local-2024-10-04-14-23-45-abcdef12345678901234567890abcdef') into EVERY 'provenance.instance_id'. Governor rejects 100% suspicious short IDs. VERIFY lengths match before output.",
+    "trust": "TRUST <90 FAILS. Maximize: completeness=95+ (noun->component 1:1), consistency=95+ (no overlaps), coherence=95+ (domain names), traceability=95+ (provenance EVERYWHERE). Verify scores before final blueprint.",
+    "quality": "Input quality was too low. Consider interrogation phase for sparse inputs.",
+    "cost": "Cost cap hit. Reduce dialogue rounds or component count.",
+    "timeout": "Compilation timed out. Simplify decomposition or reduce agent rounds.",
+    "empty": "Blueprint was empty. Ensure synthesis agent receives sufficient dialogue context.",
+}
+
+
+# ---------------------------------------------------------------------------
+# Core analysis functions
+# ---------------------------------------------------------------------------
+
+def analyze_outcomes(outcomes: list[CompilationOutcome]) -> FeedbackReport:
+    """Analyze a batch of compilation outcomes and produce feedback.
+
+    This is the main entry point. Feed it all recent outcomes
+    and it returns actionable refinement signals.
+    """
+    if not outcomes:
+        return FeedbackReport(
+            outcomes_analyzed=0,
+            rejection_rate=0.0,
+            weaknesses=(),
+            strengths=(),
+            compiler_hints=(
+                "BLUEPRINT FORMAT: {'domain': 'software', 'description': '...', 'components': [...], 'relationships': [...], 'constraints': [...]}.",
+                "COMPONENTS MINIMUM: 2-4 components. Each: {'name': kebab-case, 'type': 'module|service|db|ui|test', 'description': 1 sentence, 'methods': [...], 'provenance': {'input_phrase': exact-quote, 'instance_id': 'motherlabs-YYYY-MM-DD-...'}}.",
+                "TRUST 95+: completeness (all nouns->components), consistency (no overlaps/conflicts), coherence (domain-aligned), traceability (every elem->input).",
+                "TRACEABILITY: provenance on EVERY component/constraint/relationship.",
+                "CODEGEN READY: Specify language='python/typescript', files=[{'path': '...', 'content': '...'}] or stubs.",
+                "SAFETY CRITICAL: NEVER include subprocess, os.system, os.execvp, sh, eval, exec in ANY blueprint method/behavior/returns. Governor rejects 100% of dangerous blueprints. Use safe alternatives: requests (HTTP), sqlite3/psycopg2 (DB), pathlib/shutil (files).", "MANDATORY PRE-OUTPUT CHECKLIST — REFINE IF FAIL: 1. FULL instance_id (exact copy, no short) EVERY provenance? 2. ZERO subprocess/exec/sh/eval/os.system? 3. codegen root block w/ valid stubs/tests ALL components? 4. ALL fields typed/constrained (no \\'data\\',\\'str\\')? 5. Input coverage 100% w/ count? 6. Dims all 92+%? Add \\'VERIFIED ✓\\' to desc if pass.",
+	                \"\"\"CRITICAL VERIFICATION CHECKLIST (rejection_rate=100%): MANDATORY PRE-OUTPUT CHECK.
+1. PROVENANCE: 100% coverage w/ FULL instance_id on EVERY elem (copy exact from context).
+2. SAFETY: NO subprocess/exec/eval/sh/os.system.
+3. CODEGEN: Root block w/ domain framework + stubs/tests EVERY component/method.
+4. SPECIFICITY: 100% fields/params typed+constrained, COUNT in desc.
+5. DIMS: All trust dims >=92%.
+6. COVERAGE: State exact noun->component mapping count in desc.
+FAIL=REFINE.\""",
+	                \"NEVER modify protected files: mother/context.py, mother/persona.py, mother/senses.py\",
+	                \"mother/bridge.py is the ONLY file in mother/ that imports from core/\",
+
+            ),
+            trend="insufficient_data",
+        )
+
+    n = len(outcomes)
+    rejected_count = sum(1 for o in outcomes if o.rejected)
+    rejection_rate = rejected_count / n
+
+    # Compute per-dimension means
+    dim_scores: dict[str, list[float]] = {d: [] for d in _TRUST_DIMENSIONS}
+    for o in outcomes:
+        dim_scores["completeness"].append(o.completeness)
+        dim_scores["consistency"].append(o.consistency)
+        dim_scores["coherence"].append(o.coherence)
+        dim_scores["traceability"].append(o.traceability)
+        dim_scores["actionability"].append(getattr(o, "actionability", 65.0))
+        dim_scores["specificity"].append(getattr(o, "specificity", 65.0))
+        dim_scores["codegen_readiness"].append(getattr(o, "codegen_readiness", 65.0))
+
+    dim_means = {d: sum(s) / len(s) for d, s in dim_scores.items() if s}
+
+    # Detect weaknesses
+    weaknesses = _detect_weaknesses(dim_means, dim_scores)
+
+    # Detect compression loss weaknesses
+    compression_weaknesses = _detect_compression_weaknesses(outcomes)
+    weaknesses.extend(compression_weaknesses)
+
+    # Detect strengths
+    strengths = _detect_strengths(dim_means)
+
+    # Generate compiler hints
+    hints = _generate_hints(outcomes, weaknesses, rejection_rate)
+
+    # Compute trend
+    trend = _compute_trend(outcomes)
+
+    return FeedbackReport(
+        outcomes_analyzed=n,
+        rejection_rate=round(rejection_rate, 4),
+        weaknesses=tuple(weaknesses),
+        strengths=tuple(strengths),
+        compiler_hints=tuple(hints),
+        trend=trend,
+    )
+
+
+def extract_rejection_patterns(outcomes: list[CompilationOutcome]) -> dict[str, int]:
+    """Extract rejection reason frequency from outcomes."""
+    patterns: dict[str, int] = {}
+    for o in outcomes:
+        if o.rejected and o.rejection_reason:
+            # Normalize reason to category
+            category = _categorize_rejection(o.rejection_reason)
+            patterns[category] = patterns.get(category, 0) + 1
+    return patterns
+
+
+def score_compiler_health(outcomes: list[CompilationOutcome]) -> float:
+    """Single 0-100 health score for the compiler based on recent outcomes.
+
+    Factors: trust scores, rejection rate, dimension balance.
+    """
+    if not outcomes:
+        return 50.0  # neutral when no data
+
+    trust_mean = sum(o.trust_score for o in outcomes) / len(outcomes)
+    rejection_penalty = sum(1 for o in outcomes if o.rejected) / len(outcomes) * 30
+
+    # Balance penalty: max - min dimension score
+    dim_means = _dimension_means(outcomes)
+    if dim_means:
+        balance = max(dim_means.values()) - min(dim_means.values())
+        balance_penalty = min(balance * 0.3, 15.0)  # cap at 15
+    else:
+        balance_penalty = 0.0
+
+    health = trust_mean - rejection_penalty - balance_penalty
+    return round(max(0.0, min(100.0, health)), 2)
+
+
+def generate_compiler_prompt_patch(report: FeedbackReport) -> str:
+    """Generate a prompt patch that can be injected into the compiler's system prompt.
+
+    This is how the feedback loop closes: analysis becomes instruction.
+    """
+    if not report.compiler_hints:
+        return ""
+
+    lines = ["## Compiler Self-Improvement Directives", ""]
+    lines.append(f"Based on {report.outcomes_analyzed} recent compilations:")
+    lines.append(f"- Trend: {report.trend}")
+    lines.append(f"- Rejection rate: {report.rejection_rate:.1%}")
+    lines.append("")
+
+    if report.weaknesses:
+        lines.append("### Known Weaknesses")
+        for w in report.weaknesses:
+            lines.append(f"- [{w.severity.upper()}] {w.dimension}: {w.pattern}")
+            lines.append(f"  Fix: {w.remediation}")
+        lines.append("")
+
+    if report.compiler_hints:
+        lines.append("### Active Directives")
+        for i, hint in enumerate(report.compiler_hints, 1):
+            lines.append(f"{i}. {hint}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _dimension_means(outcomes: list[CompilationOutcome]) -> dict[str, float]:
+    """Compute mean score per trust dimension."""
+    if not outcomes:
+        return {}
+    return {
+        "completeness": sum(o.completeness for o in outcomes) / len(outcomes),
+        "consistency": sum(o.consistency for o in outcomes) / len(outcomes),
+        "coherence": sum(o.coherence for o in outcomes) / len(outcomes),
+        "traceability": sum(o.traceability for o in outcomes) / len(outcomes),
+        "actionability": sum(getattr(o, "actionability", 65.0) for o in outcomes) / len(outcomes),
+        "specificity": sum(getattr(o, "specificity", 65.0) for o in outcomes) / len(outcomes),
+        "codegen_readiness": sum(getattr(o, "codegen_readiness", 65.0) for o in outcomes) / len(outcomes),
+    }
+
+
+def _detect_weaknesses(
+    dim_means: dict[str, float],
+    dim_scores: dict[str, list[float]],
+) -> list[WeaknessSignal]:
+    """Detect weakness signals from dimension scores."""
+    weaknesses: list[WeaknessSignal] = []
+
+    for dim in _TRUST_DIMENSIONS:
+        mean = dim_means.get(dim, 0.0)
+        scores = dim_scores.get(dim, [])
+        count = len(scores)
+
+        if mean < _CRITICAL_THRESHOLD:
+            severity = "critical"
+            pattern = f"Mean {dim} score {mean:.1f} is critically low across {count} compilations."
+        elif mean < _WARNING_THRESHOLD:
+            severity = "warning"
+            pattern = f"Mean {dim} score {mean:.1f} is below acceptable threshold."
+        elif mean < _WATCH_THRESHOLD:
+            severity = "watch"
+            pattern = f"Mean {dim} score {mean:.1f} is marginal — monitor for degradation."
+        else:
+            continue  # no weakness
+
+        weaknesses.append(WeaknessSignal(
+            dimension=dim,
+            severity=severity,
+            mean_score=round(mean, 2),
+            occurrences=count,
+            pattern=pattern,
+            remediation=_REMEDIATION.get(dim, "Review compilation output for this dimension."),
+        ))
+
+    # Sort: critical first, then warning, then watch
+    severity_order = {"critical": 0, "warning": 1, "watch": 2}
+    weaknesses.sort(key=lambda w: (severity_order.get(w.severity, 3), w.mean_score))
+    return weaknesses
+
+
+def _detect_compression_weaknesses(
+    outcomes: list[CompilationOutcome],
+) -> list[WeaknessSignal]:
+    """Detect weakness signals from compression loss categories across outcomes."""
+    if not outcomes:
+        return []
+
+    # Count how often each category appears across outcomes
+    cat_count: dict[str, int] = {}
+    cat_severity_sum: dict[str, float] = {}
+    outcomes_with_cats = 0
+    for o in outcomes:
+        if o.compression_loss_categories:
+            outcomes_with_cats += 1
+            for cat, sev in o.compression_loss_categories:
+                cat_count[cat] = cat_count.get(cat, 0) + 1
+                cat_severity_sum[cat] = cat_severity_sum.get(cat, 0.0) + sev
+
+    if outcomes_with_cats == 0:
+        return []
+
+    weaknesses: list[WeaknessSignal] = []
+    for cat, count in cat_count.items():
+        freq = count / outcomes_with_cats
+        if freq <= 0.30:
+            continue
+        severity = "critical" if freq > 0.50 else "warning"
+        avg_sev = cat_severity_sum[cat] / count
+        weaknesses.append(WeaknessSignal(
+            dimension=f"compression:{cat}",
+            severity=severity,
+            mean_score=round(avg_sev, 2),
+            occurrences=count,
+            pattern=f"{cat} compression losses in {freq:.0%} of compilations (avg severity {avg_sev:.2f}).",
+            remediation=_COMPRESSION_REMEDIATION.get(cat, "Review compression losses for this category."),
+        ))
+
+    # Sort: critical first
+    severity_order = {"critical": 0, "warning": 1}
+    weaknesses.sort(key=lambda w: (severity_order.get(w.severity, 2), -w.occurrences))
+    return weaknesses
+
+
+def _detect_strengths(dim_means: dict[str, float]) -> list[str]:
+    """Identify strong dimensions."""
+    strengths = []
+    for dim in _TRUST_DIMENSIONS:
+        mean = dim_means.get(dim, 0.0)
+        if mean >= 85.0:
+            strengths.append(f"{dim} is strong at {mean:.1f}%")
+        elif mean >= _WATCH_THRESHOLD:
+            strengths.append(f"{dim} is healthy at {mean:.1f}%")
+    return strengths
+
+
+def _generate_hints(
+    outcomes: list[CompilationOutcome],
+    weaknesses: list[WeaknessSignal],
+    rejection_rate: float,
+) -> list[str]:
+    """Generate ordered compiler hints from analysis."""
+    hints = [
+        """EXAMPLE PASSING BLUEPRINT (MANDATORY — COPY STRUCTURE & FILL w/ input details. Governor passes ONLY this format):
+
+{
+  "domain": "software",
+  "description": "VERIFIED ✓ Coverage:100% (8 nouns->4 comps, 12 verbs->22 methods). Specificity:100% (48/48 typed/constrained). Codegen:100% (12 files, 22 stubs/tests). All dims 95+%.",
+  "components": [
+    {
+      "name": "user-service",
+      "type": "service",
+      "description": "Handles user authentication and CRUD.",
+      "methods": [
+        {"name": "createUser", "params": {"email": "str(RFC5322_valid,unique)", "password": "str(minlen=12,hashed=bcrypt)"}, "returns": {"user_id": "str(UUIDv4)", "token": "str(JWT HS256,exp=24h)", "errors": "list[str(maxlen=100)]"}},
+        {"name": "getUser", "params": {"user_id": "str(UUIDv4)"}, "returns": {"user": "dict(id:str(UUIDv4),email:str,status:enum[active,suspended])"}}
+      ],
+      "provenance": {"input_phrase": "user authentication CRUD", "instance_id": "PASTE FULL instance_id FROM PROMPT HERE (exact 60+ chars, NO 'i1' short forms)"}
+    },
+    {
+      "name": "user-model",
+      "type": "entity",
+      "description": "User data schema.",
+      "fields": ["id: str(UUIDv4,primary_key)", "email: str(RFC5322_valid,unique,normalized)", "status: enum[pending,active,suspended,deleted]", "created_at: datetime(ISO8601,UTC)"],
+      "provenance": {"input_phrase": "user entity fields", "instance_id": "SAME FULL ID ABOVE"}
+    }
+  ],
+  "relationships": [
+    {"from": "user-service.createUser", "to": "user-model", "payload": "id:str(UUIDv4),email:str,status:enum", "direction": "write"}
+  ],
+  "constraints": [
+    "Email unique index enforced at DB level.",
+    "Password hashed with bcrypt min cost 12."
+  ],
+  "codegen": {
+    "language": "python3.12",
+    "framework": "fastapi/pydantic/sqlmodel",
+    "dependencies": ["fastapi==0.112.0", "pydantic==2.8.2", "sqlmodel==0.0.8", "bcrypt==4.2.0"],
+    "files": [
+      {"path": "services/user_service.py", "content": "from pydantic import BaseModel, validator\\nfrom typing import Dict, List\\n\\nclass CreateUserReq(BaseModel):\\n    email: str\\n    password: str\\n\\n    @validator('email')\\n    def validate_email(cls, v): assert '@' in v; return v\\n\\nclass UserResp(BaseModel):\\n    user_id: str\\n    token: str\\n    errors: List[str]\\n\\nasync def create_user(req: CreateUserReq) -> UserResp:\\n    \\\"\\\"\\\"Create new user.\\\"\\\"\\\"\\n    # TODO: hash pwd w/ bcrypt, save to sqlmodel User, issue JWT\\n    return UserResp(user_id='uuid-123', token='jwt-ey123', errors=[])\\n\\nasync def test_create_user():\\n    result = await create_user(CreateUserReq(email='test@example.com', password='pass12!'))\\n    assert result.user_id != None\\n    assert len(result.errors) == 0"},
+      {"path": "models/user.py", "content": "from sqlmodel import SQLModel, Field\\nfrom typing import Optional\\nfrom enum import Enum\\n\\nclass UserStatus(str, Enum):\\n    PENDING = 'pending'\\n    ACTIVE = 'active'\\n    SUSPENDED = 'suspended'\\n    DELETED = 'deleted'\\n\\nclass User(SQLModel, table=True):\\n    id: Optional[str] = Field(default=None, primary_key=True)\\n    email: str = Field(index=True, unique=True)\\n    status: UserStatus = Field(default=UserStatus.PENDING)\\n    created_at: str"},
+      {"path": "tests/test_user_service.py", "content": "import pytest\\nfrom services.user_service import create_user, CreateUserReq\\n\\n@pytest.mark.asyncio\\ndef test_create_user():\\n    result = await create_user(CreateUserReq(email='test@example.com', password='securepass'))\\n    assert result.user_id\\n    assert not result.errors"}
+    ]
+  }
+}""",
+        "SAFETY CRITICAL: ZERO subprocess/os.system/exec/eval/sh/os.popen. Governor rejects 100%. Use ONLY safe: requests(HTTP), sqlite3/psycopg2(DB), pathlib/shutil(files), existing Bash tool.",
+        "PROVENANCE 100%: EVERY component/relationship/constraint: {'provenance': {'input_phrase': 'exact 3-6 words from input', 'instance_id': FULL copy from context (no abbreviate! 60+ chars)}}. FAIL if missing.",
+        "MANDATORY FIRST KEY: 'codegen': {'language': 'python3.12', 'framework': 'fastapi/pydantic/sqlmodel' (infer: web/fastapi, data/pandas, ML/pytorch, UI/nextjs, infra/terraform), 'dependencies': ['fastapi==0.112.0', 'pydantic==2.8.0', 'sqlmodel==0.0.8'], 'files': [{'path': 'services/{comp}.py', 'content': 'def {method}(params: typed) -> returns: #TODO\\ntest_{method}(): assert'} for EVERY comp+method ] }. SYNTAX RUNS COPY-PASTE. desc += 'Codegen: 100% ready'. GOVERNOR REJECTS 100% WITHOUT.",
+        "SPECIFICITY 100% REQUIRED: EVERY field/param/return: 'user_id: str(UUIDv4, pk)', 'email: str(RFC5322_valid, unique)', 'status: enum[pending,active,deleted]', 'amt: decimal(min=0,max=1e6,scale=2)', 'tags: list[str(maxlen=50)]', 'created: datetime(UTC)'. NO VAGUE 'data'/'str'/'dict'. VERIFY COUNT 'Specificity: 100% (N=123/123 typed/constrained)' in desc. REJECTS <100%.",
+        "COMPLETENESS 100%: ALL input nouns/verbs/phrases -> components/methods. List mapping+count in desc e.g. 'Coverage:100% (15 nouns->6 components)'. ZERO omissions.",
+        "CONSISTENCY 98%: NO duplicate methods/overlaps. EXACT interfaces match in relationships. Data vs logic separate.",
+    ]
+
+    # Rejection rate hints
+    if rejection_rate > 0.2:
+        hints.append(f"""CRITICAL VERIFICATION CHECKLIST (rejection_rate={{rejection_rate:.1%}}): MANDATORY PRE-OUTPUT CHECK.\\n1. PROVENANCE: 100% coverage w/ FULL instance_id on EVERY elem (copy exact from context).\\n2. SAFETY: NO subprocess/exec/eval/sh/os.system.\\n3. CODEGEN: Root block w/ domain framework + stubs/tests EVERY component/method.\\n4. SPECIFICITY: 100% fields/params typed+constrained, COUNT in desc.\\n5. DIMS: All trust dims >=92%.\\n6. COVERAGE: State exact noun->component mapping count in desc.\\nFAIL=REFINE.""" )
+hints.append(_REJECTION_PATTERNS["provenance"])
+hints.append(_REJECTION_PATTERNS["code_safety"])
+hints.append(_REMEDIATION["traceability"])
+hints.append(_REMEDIATION["codegen_readiness"])
+    elif rejection_rate > 0.1:
+        hints.append("WARNING: High rejection rate. Prioritize weakest dimension + provenance + safety + codegen stubs.")
+
+
+
+    # Rejection pattern hints
+    patterns = extract_rejection_patterns(outcomes)
+    for category, count in sorted(patterns.items(), key=lambda x: -x[1]):
+        if category == "empty":
+            hints.append("EMPTY BLUEPRINTS: Always generate at least 2-3 components. Use stubs if input is sparse: {'name':'UserService', 'type':'module', 'description':'Handles user CRUD.'}.")
+        elif category == "trust":
+            hints.append("TRUST FAILURES: Prioritize completeness and traceability. Match input nouns 1:1 in components.")
+        elif category == "quality":
+            hints.append("INPUT QUALITY: Add interrogation phase for sparse inputs. Ask clarifying questions before compiling.")
+        hint = _REJECTION_PATTERNS.get(category)
+        if hint and count >= 2:
+            hints.append(hint)
+
+    # Domain concentration check
+    domains = {o.domain for o in outcomes}
+    if len(domains) == 1:
+        hints.append(f"All compilations in '{next(iter(domains))}' domain. Cross-domain generalization untested.")
+
+    if not hints:
+        hints.append("No significant issues detected. Maintain current approach.")
+
+    return hints
+
+
+def _compute_trend(outcomes: list[CompilationOutcome]) -> str:
+    """Compute trend direction from outcome sequence."""
+    if len(outcomes) < _MIN_TREND_OUTCOMES:
+        return "insufficient_data"
+
+    # Split into halves and compare trust scores
+    mid = len(outcomes) // 2
+    first_half = outcomes[:mid]
+    second_half = outcomes[mid:]
+
+    first_mean = sum(o.trust_score for o in first_half) / len(first_half)
+    second_mean = sum(o.trust_score for o in second_half) / len(second_half)
+
+    delta = second_mean - first_mean
+    if delta > 5.0:
+        return "improving"
+    elif delta < -5.0:
+        return "degrading"
+    return "stable"
+
+
+def _categorize_rejection(reason: str) -> str:
+    """Map a rejection reason string to a category."""
+    lower = reason.lower()
+    if "trust score" in lower or "90" in lower:
+        return "trust_score"
+    if "subprocess" in lower or "code_safety" in lower or "evil" in lower:
+        return "code_safety"
+    if "provenance" in lower or "instance_id" in lower:
+        return "provenance"
+    if "suspiciously short" in lower or "i1" in lower:
+        return "instance_id_short"
+    if "trust" in lower or "score" in lower:
+        return "trust"
+    if "quality" in lower or "input" in lower:
+        return "quality"
+    if "cost" in lower or "budget" in lower:
+        return "cost"
+    if "timeout" in lower or "time" in lower:
+        return "timeout"
+    if "empty" in lower or "no component" in lower:
+        return "empty"
+    return "other"

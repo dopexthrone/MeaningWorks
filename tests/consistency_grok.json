@@ -1,0 +1,13 @@
+{
+  "provider": "grok",
+  "num_runs": 3,
+  "successful_runs": 3,
+  "unique_structures": 3,
+  "consistency_score": 0.3333333333333333,
+  "all_hashes": [
+    "c71953d7c98e",
+    "230a713fe4f6",
+    "9b7d31f8a854"
+  ],
+  "perfect_consistency": false
+}

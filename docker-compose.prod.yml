@@ -1,0 +1,19 @@
+# Production override — pulls pre-built images from GHCR instead of local builds.
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+services:
+  api:
+    image: ghcr.io/dopexthrone/meaningworks:latest
+    build: !reset null
+
+  worker:
+    image: ghcr.io/dopexthrone/meaningworks:latest
+    build: !reset null
+
+  telegram-bot:
+    image: ghcr.io/dopexthrone/meaningworks:latest
+    build: !reset null
+
+  discord-bot:
+    image: ghcr.io/dopexthrone/meaningworks:latest
+    build: !reset null

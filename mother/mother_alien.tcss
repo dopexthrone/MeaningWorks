@@ -1,0 +1,628 @@
+/* Mother TUI — ALIEN (1979) MU-TH-UR 6000 Aesthetic
+ *
+ * Design principles:
+ * - Monochrome phosphor green CRT glow (#00ff00 family)
+ * - Pure black background (#000000) for deep space
+ * - Blocky, bitmap-style borders (thick ASCII)
+ * - Minimal use of amber (#ff9900) for warnings/alerts
+ * - ALL CAPS text where appropriate (MU-TH-ER style)
+ * - Scan line effect via subtle gradients
+ * - High contrast, utilitarian, industrial
+ */
+
+/* ===== Color Palette ===== */
+/*
+ * Primary:   #00ff00 (phosphor green)
+ * Dim:       #009900 (darker green)
+ * Background:#000000 (pure black)
+ * Panel:     #001100 (very dark green)
+ * Border:    #003300 (dark green)
+ * Accent:    #00ff00 (bright green)
+ * Warning:   #ff9900 (amber)
+ * Error:     #ff3300 (red amber)
+ */
+
+/* ===== Global ===== */
+
+Screen {
+    background: #000000;
+    color: #00ff00;
+}
+
+/* ===== Chat Screen ===== */
+
+#placeholder {
+    width: 100%;
+    height: 100%;
+    content-align: center middle;
+    text-style: dim;
+    color: #009900;
+}
+
+#chat-container {
+    height: 1fr;
+    layout: vertical;
+}
+
+#chat-area {
+    height: 1fr;
+    scrollbar-color: #00ff00;
+    scrollbar-color-hover: #00ff00;
+    scrollbar-background: #000000;
+    padding: 0 1;
+    background: #000000;
+}
+
+#input-area {
+    dock: bottom;
+    height: auto;
+    max-height: 14;
+    padding: 0 1;
+    background: #001100;
+    border-top: heavy #003300;
+}
+
+#input-area TextArea {
+    height: 3;
+    min-height: 3;
+    max-height: 12;
+    background: #000000;
+    border: heavy #003300;
+    color: #00ff00;
+    padding: 0 1;
+}
+
+#input-area TextArea:focus {
+    border: heavy #00ff00;
+}
+
+/* Message blocks */
+.message-user {
+    background: #001100;
+    color: #00ff00;
+    border-left: heavy #00ff00;
+    padding: 1;
+    margin: 0 0 1 0;
+}
+
+.message-mother {
+    background: #000000;
+    color: #00ff00;
+    border-left: heavy #003300;
+    padding: 1;
+    margin: 0 0 1 0;
+}
+
+.message-system {
+    background: #000000;
+    color: #009900;
+    border-left: heavy #003300;
+    padding: 1;
+    margin: 0 0 1 0;
+    text-style: dim;
+}
+
+.message-error {
+    background: #110000;
+    color: #ff3300;
+    border-left: heavy #ff3300;
+    padding: 1;
+    margin: 0 0 1 0;
+}
+
+.message-header {
+    color: #009900;
+    text-style: bold;
+    margin: 0 0 0 0;
+}
+
+.message-timestamp {
+    color: #006600;
+    text-style: dim;
+}
+
+.message-content {
+    color: #00ff00;
+    margin: 0;
+}
+
+/* ===== Status Bar ===== */
+
+#status-bar {
+    dock: top;
+    height: 1;
+    background: #001100;
+    color: #00ff00;
+    padding: 0 1;
+    border-bottom: heavy #003300;
+}
+
+#status-model {
+    width: 1fr;
+    text-align: left;
+    color: #009900;
+}
+
+#status-connection {
+    width: auto;
+    text-align: center;
+    color: #00ff00;
+}
+
+#status-cost {
+    width: auto;
+    text-align: right;
+    color: #ff9900;  /* Amber for cost */
+}
+
+/* ===== Pipeline Panel ===== */
+
+#pipeline-panel {
+    width: 30;
+    height: 1fr;
+    dock: right;
+    background: #000000;
+    border-left: heavy #003300;
+    padding: 1;
+}
+
+#pipeline-title {
+    text-align: center;
+    text-style: bold;
+    color: #00ff00;
+    margin: 0 0 1 0;
+}
+
+.pipeline-stage {
+    height: 3;
+    background: #001100;
+    border: heavy #003300;
+    margin: 0 0 1 0;
+    padding: 0 1;
+    color: #009900;
+}
+
+.pipeline-stage-active {
+    border: heavy #00ff00;
+    background: #002200;
+    color: #00ff00;
+}
+
+.pipeline-stage-complete {
+    border: heavy #006600;
+    background: #001100;
+    color: #006600;
+}
+
+.pipeline-stage-name {
+    text-style: bold;
+    color: inherit;
+}
+
+.pipeline-stage-status {
+    text-style: dim;
+    color: inherit;
+}
+
+/* ===== Footer ===== */
+
+Footer {
+    background: #001100;
+    color: #009900;
+}
+
+Footer > .footer--key {
+    background: #003300;
+    color: #00ff00;
+}
+
+Footer > .footer--description {
+    color: #009900;
+}
+
+/* ===== Loading Screen ===== */
+
+#loading-container {
+    align: center middle;
+    background: #000000;
+}
+
+#loading-box {
+    width: 60;
+    height: auto;
+    padding: 3;
+    background: #001100;
+    border: heavy #003300;
+    align: center middle;
+}
+
+#loading-title {
+    text-align: center;
+    text-style: bold;
+    color: #00ff00;
+    margin: 0 0 2 0;
+}
+
+#loading-spinner {
+    color: #00ff00;
+    text-align: center;
+}
+
+#loading-message {
+    text-align: center;
+    color: #009900;
+    margin: 2 0 0 0;
+}
+
+/* ===== Setup Wizard ===== */
+
+#setup-container {
+    width: 100%;
+    height: 100%;
+    align: center middle;
+    background: #000000;
+}
+
+#setup-box {
+    width: 72;
+    height: auto;
+    max-height: 90%;
+    padding: 3;
+    background: #001100;
+    border: heavy #003300;
+}
+
+#setup-title {
+    text-align: center;
+    text-style: bold;
+    color: #00ff00;
+    margin: 0 0 2 0;
+}
+
+#setup-progress {
+    text-align: center;
+    color: #009900;
+    margin: 0 0 2 0;
+}
+
+#setup-body {
+    height: auto;
+    margin: 0 0 2 0;
+}
+
+#setup-body Static {
+    color: #00ff00;
+    margin: 0 0 1 0;
+}
+
+#setup-body Input {
+    background: #000000;
+    border: heavy #003300;
+    color: #00ff00;
+    margin: 0 0 1 0;
+}
+
+#setup-body Input:focus {
+    border: heavy #00ff00;
+}
+
+#setup-body Input::placeholder {
+    color: #009900;
+    text-style: dim;
+}
+
+#setup-nav {
+    width: 100%;
+    height: auto;
+    align: center middle;
+}
+
+#setup-nav Button {
+    margin: 0 1;
+    background: #003300;
+    color: #00ff00;
+    border: heavy #003300;
+}
+
+#setup-nav Button:hover {
+    background: #005500;
+    border: heavy #00ff00;
+}
+
+#setup-nav Button.-primary {
+    background: #005500;
+    border: heavy #00ff00;
+}
+
+#setup-nav Button.-primary:hover {
+    background: #007700;
+}
+
+/* ===== Settings Screen ===== */
+
+#settings-container {
+    width: 100%;
+    height: 100%;
+    align: center middle;
+}
+
+#settings-box {
+    width: 72;
+    height: 100%;
+    overflow-y: auto;
+    padding: 1 3;
+    background: #001100;
+    border: heavy #003300;
+}
+
+#settings-title {
+    text-align: center;
+    text-style: bold;
+    color: #00ff00;
+    margin: 0 0 1 0;
+}
+
+.settings-section {
+    margin: 0 0 1 0;
+    padding: 0 1;
+    border: heavy #003300;
+}
+
+.settings-section-title {
+    text-style: bold;
+    color: #00ff00;
+    margin: 0;
+}
+
+.settings-section Static {
+    color: #00ff00;
+    height: 1;
+    margin: 0;
+}
+
+.settings-section Input {
+    background: #000000;
+    border: heavy #003300;
+    color: #00ff00;
+    margin: 0;
+}
+
+.settings-section Input:focus {
+    border: heavy #00ff00;
+}
+
+.settings-section Input::placeholder {
+    color: #009900;
+    text-style: dim;
+}
+
+.settings-section RadioSet {
+    height: auto;
+}
+
+.settings-section RadioButton {
+    background: #000000;
+    color: #009900;
+    height: 1;
+}
+
+.settings-section RadioButton:hover {
+    background: #001100;
+}
+
+.settings-section RadioButton.-selected {
+    color: #00ff00;
+}
+
+/* Switch rows — setup wizard + settings */
+.perm-label {
+    width: 1fr;
+    height: 1;
+    content-align: left middle;
+}
+
+.settings-section Horizontal {
+    height: auto;
+    max-height: 3;
+    align: left middle;
+}
+
+#setup-body Horizontal {
+    height: 3;
+    align: left middle;
+}
+
+/* Switch widget styling */
+Switch {
+    background: #003300;
+    color: #006600;
+}
+
+Switch:hover {
+    background: #005500;
+}
+
+Switch > .switch--slider {
+    color: #00ff00;
+    background: #003300;
+}
+
+Switch.-on > .switch--slider {
+    color: #000000;
+    background: #00ff00;
+}
+
+/* ===== Buttons ===== */
+
+Button {
+    background: #003300;
+    color: #00ff00;
+    border: heavy #003300;
+}
+
+Button:hover {
+    background: #005500;
+    border: heavy #00ff00;
+}
+
+Button.-primary {
+    background: #005500;
+    border: heavy #00ff00;
+}
+
+Button.-primary:hover {
+    background: #007700;
+}
+
+Button:disabled {
+    background: #001100;
+    color: #003300;
+    border: heavy #002200;
+}
+
+/* ===== Trust Badge ===== */
+
+.trust-badge {
+    width: auto;
+    height: 3;
+    background: #001100;
+    border: heavy #003300;
+    padding: 0 1;
+    margin: 0 1 0 0;
+}
+
+.trust-badge-high {
+    border: heavy #00ff00;
+    color: #00ff00;
+}
+
+.trust-badge-medium {
+    border: heavy #ff9900;
+    color: #ff9900;
+}
+
+.trust-badge-low {
+    border: heavy #ff3300;
+    color: #ff3300;
+}
+
+.trust-label {
+    text-style: bold;
+}
+
+.trust-score {
+    color: inherit;
+}
+
+/* ===== Scrollbars ===== */
+
+::-webkit-scrollbar {
+    background: #000000;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #003300;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #00ff00;
+}
+
+/* ===== Radio Buttons ===== */
+
+RadioButton {
+    background: #000000;
+    color: #009900;
+}
+
+RadioButton:hover {
+    background: #001100;
+}
+
+RadioButton.-selected {
+    color: #00ff00;
+}
+
+/* ===== Containers ===== */
+
+Container {
+    background: #000000;
+}
+
+Vertical {
+    background: transparent;
+}
+
+Horizontal {
+    background: transparent;
+}
+
+/* ===== Markdown Rendering ===== */
+
+Markdown {
+    background: transparent;
+}
+
+MarkdownH1 {
+    color: #00ff00;
+    text-style: bold;
+}
+
+MarkdownH2 {
+    color: #00ff00;
+}
+
+MarkdownH3 {
+    color: #009900;
+}
+
+MarkdownCode {
+    background: #001100;
+    color: #00ff00;
+    border: heavy #003300;
+}
+
+MarkdownBlockQuote {
+    background: #001100;
+    border-left: heavy #003300;
+    color: #009900;
+}
+
+/* ===== Lists ===== */
+
+MarkdownBulletList {
+    color: #00ff00;
+}
+
+MarkdownOrderedList {
+    color: #00ff00;
+}
+
+/* ===== Links ===== */
+
+MarkdownLink {
+    color: #00ff00;
+    text-style: underline;
+}
+
+MarkdownLink:hover {
+    color: #00ff00;
+    text-style: bold underline;
+}
+
+/* ===== Tables ===== */
+
+MarkdownTable {
+    border: heavy #003300;
+    background: #001100;
+}
+
+MarkdownTH {
+    background: #003300;
+    color: #00ff00;
+    text-style: bold;
+}
+
+MarkdownTD {
+    color: #00ff00;
+}

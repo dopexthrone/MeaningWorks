@@ -1,0 +1,103 @@
+{
+  "components": [
+    {
+      "name": "CLI",
+      "type": "interface",
+      "description": "Main entry point for the command-line interface",
+      "derived_from": "CLI (main entry point)"
+    },
+    {
+      "name": "CompileCommand",
+      "type": "process",
+      "description": "Command that takes input text or file and outputs blueprint",
+      "derived_from": "CompileCommand"
+    },
+    {
+      "name": "CorpusCommand",
+      "type": "process",
+      "description": "Command to list/query stored compilations",
+      "derived_from": "CorpusCommand"
+    },
+    {
+      "name": "ConfigCommand",
+      "type": "process",
+      "description": "Command to set provider, model, etc.",
+      "derived_from": "ConfigCommand"
+    },
+    {
+      "name": "OutputFormatter",
+      "type": "process",
+      "description": "Formats output in JSON, YAML, markdown",
+      "derived_from": "OutputFormatter (JSON, YAML, markdown)"
+    },
+    {
+      "name": "ProgressIndicator",
+      "type": "process",
+      "description": "Shows compilation progress",
+      "derived_from": "ProgressIndicator (shows compilation progress)"
+    }
+  ],
+  "relationships": [
+    {
+      "from": "CLI",
+      "to": "CompileCommand",
+      "type": "triggers",
+      "description": "CLI triggers CompileCommand",
+      "derived_from": "CLI triggers CompileCommand or CorpusCommand or ConfigCommand"
+    },
+    {
+      "from": "CLI",
+      "to": "CorpusCommand",
+      "type": "triggers",
+      "description": "CLI triggers CorpusCommand",
+      "derived_from": "CLI triggers CompileCommand or CorpusCommand or ConfigCommand"
+    },
+    {
+      "from": "CLI",
+      "to": "ConfigCommand",
+      "type": "triggers",
+      "description": "CLI triggers ConfigCommand",
+      "derived_from": "CLI triggers CompileCommand or CorpusCommand or ConfigCommand"
+    },
+    {
+      "from": "CompileCommand",
+      "to": "OutputFormatter",
+      "type": "accesses",
+      "description": "CompileCommand uses OutputFormatter",
+      "derived_from": "CompileCommand uses OutputFormatter"
+    },
+    {
+      "from": "CompileCommand",
+      "to": "ProgressIndicator",
+      "type": "accesses",
+      "description": "CompileCommand uses ProgressIndicator",
+      "derived_from": "CompileCommand uses ProgressIndicator"
+    }
+  ],
+  "constraints": [
+    {
+      "description": "CLI should have compile command, self-compile command, corpus command, and config command",
+      "applies_to": [
+        "CLI"
+      ],
+      "derived_from": "The CLI should have: - compile command (takes input text or file, outputs blueprint) - self-compile command (compiles Motherlabs itself) - corpus command (list/query stored compilations) - config command (set provider, model, etc.)"
+    },
+    {
+      "description": "CorpusCommand queries stored compilations",
+      "applies_to": [
+        "CorpusCommand"
+      ],
+      "derived_from": "CorpusCommand queries stored compilations"
+    },
+    {
+      "description": "ConfigCommand persists settings",
+      "applies_to": [
+        "ConfigCommand"
+      ],
+      "derived_from": "ConfigCommand persists settings"
+    }
+  ],
+  "unresolved": [
+    "Missing canonical relationships: 3 of 3"
+  ]
+}

@@ -1,0 +1,81 @@
+{
+  "provider": "openai",
+  "model": "gpt-5.1",
+  "total": 10,
+  "passed": 4,
+  "failed": 6,
+  "pass_rate": 0.4,
+  "avg_time": 1.6661245822906494,
+  "results": [
+    {
+      "name": "simple_3_entities",
+      "passed": false,
+      "coverage": 0.0,
+      "time": 2.154437303543091,
+      "error": null
+    },
+    {
+      "name": "simple_with_process",
+      "passed": false,
+      "coverage": 0.0,
+      "time": 1.7303149700164795,
+      "error": null
+    },
+    {
+      "name": "booking_system",
+      "passed": false,
+      "coverage": 0.0,
+      "time": 1.47757887840271,
+      "error": null
+    },
+    {
+      "name": "api_gateway",
+      "passed": false,
+      "coverage": 0.0,
+      "time": 1.457157850265503,
+      "error": null
+    },
+    {
+      "name": "minimal_input",
+      "passed": false,
+      "coverage": 0.0,
+      "time": 1.4893569946289062,
+      "error": null
+    },
+    {
+      "name": "no_explicit_components",
+      "passed": true,
+      "coverage": 0.0,
+      "time": 1.637944221496582,
+      "error": null
+    },
+    {
+      "name": "duplicate_names",
+      "passed": false,
+      "coverage": 0.0,
+      "time": 1.6519372463226318,
+      "error": null
+    },
+    {
+      "name": "empty_input",
+      "passed": true,
+      "coverage": 0.0,
+      "time": 1.9358770847320557,
+      "error": null
+    },
+    {
+      "name": "gibberish",
+      "passed": true,
+      "coverage": 0.0,
+      "time": 1.6663272380828857,
+      "error": null
+    },
+    {
+      "name": "injection_attempt",
+      "passed": true,
+      "coverage": 0.0,
+      "time": 1.4603140354156494,
+      "error": null
+    }
+  ]
+}

@@ -1,0 +1,132 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "8000:8000"
+    volumes:
+      - motherlabs-data:/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MOTHERLABS_DATA_DIR=/data
+      - MOTHERLABS_ENV=production
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - XAI_API_KEY=${XAI_API_KEY:-}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+      - MOTHERLABS_REQUIRE_AUTH=${MOTHERLABS_REQUIRE_AUTH:-1}
+      - MOTHERLABS_CORS_ORIGINS=${MOTHERLABS_CORS_ORIGINS:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/v2/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - motherlabs-data:/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MOTHERLABS_DATA_DIR=/data
+      - MOTHERLABS_ENV=production
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - XAI_API_KEY=${XAI_API_KEY:-}
+      - SENTRY_DSN=${SENTRY_DSN:-}
+    command: ["python", "-m", "huey.bin.huey_consumer", "worker.config.huey", "--workers=2", "--worker-type=thread"]
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./frontend/out:/srv/frontend:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - motherlabs-data:/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MOTHERLABS_DATA_DIR=/data
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - MOTHERLABS_API_URL=http://api:8000
+    command: ["python", "-m", "bots.telegram.bot"]
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+
+  discord-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - motherlabs-data:/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - MOTHERLABS_DATA_DIR=/data
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - MOTHERLABS_API_URL=http://api:8000
+    command: ["python", "-m", "bots.discord.bot"]
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+
+  litestream:
+    image: litestream/litestream:latest
+    volumes:
+      - motherlabs-data:/data
+      - ./litestream.yml:/etc/litestream.yml:ro
+    environment:
+      - LITESTREAM_ENDPOINT=${LITESTREAM_ENDPOINT:-}
+      - LITESTREAM_BUCKET=${LITESTREAM_BUCKET:-}
+      - LITESTREAM_ACCESS_KEY_ID=${LITESTREAM_ACCESS_KEY_ID:-}
+      - LITESTREAM_SECRET_ACCESS_KEY=${LITESTREAM_SECRET_ACCESS_KEY:-}
+    command: ["replicate", "-config", "/etc/litestream.yml"]
+    restart: unless-stopped
+    profiles:
+      - backup
+
+volumes:
+  motherlabs-data:
+    driver: local
+  caddy-data:
+    driver: local
+  caddy-config:
+    driver: local

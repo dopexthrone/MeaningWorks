@@ -1,0 +1,91 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "motherlabs"
+version = "1.0.0"
+description = "A personal AI that lives on your machine. Semantic compiler + autonomous entity."
+readme = "README.md"
+license = "Elastic-2.0"
+requires-python = ">=3.10"
+authors = [
+    { name = "Alex", email = "alex@motherlabs.ai" }
+]
+keywords = [
+    "ai",
+    "semantic-compilation", 
+    "specification",
+    "blueprint",
+    "context-graph",
+    "agents"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Code Generators",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "anthropic>=0.40.0,<1.0",
+    "openai>=1.0.0,<2.0",
+    "pyyaml>=6.0",
+    "requests>=2.28.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "httpx>=0.24.0",
+    "websockets>=13.0",
+    "textual>=1.0.0,<2.0",
+    "huey>=2.5.0,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio",
+    "pytest-cov",
+    "pytest-timeout",
+    "httpx>=0.24.0",
+]
+gemini = [
+    "google-generativeai>=0.3.0",
+]
+voice = [
+    "elevenlabs>=1.0.0",
+]
+microphone = [
+    "sounddevice>=0.4.0",
+    "scipy>=1.10.0",
+]
+perception = [
+    "pillow>=9.0.0",
+]
+monitoring = [
+    "sentry-sdk[fastapi]>=2.0",
+]
+bot = [
+    "discord.py>=2.3.0",
+]
+
+[project.scripts]
+mother = "mother.app:main"
+motherlabs = "cli.main:main"
+motherlabs-api = "api.main:app"
+
+[project.urls]
+Homepage = "https://github.com/dopexthrone/MeaningWorks"
+Documentation = "https://motherlabs.ai/docs"
+Repository = "https://github.com/dopexthrone/MeaningWorks"
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: Real-LLM integration tests (require ANTHROPIC_API_KEY, cost real money)",
+]
+addopts = "-m 'not slow'"
+
+[tool.hatch.build.targets.wheel]
+packages = ["core", "agents", "api", "persistence", "cli", "codegen", "adapters", "kernel", "messaging", "motherlabs_platform", "mother", "worker", "bots"]

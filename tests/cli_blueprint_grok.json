@@ -1,0 +1,108 @@
+{
+  "components": [
+    {
+      "name": "CLI",
+      "type": "interface",
+      "description": "main entry point",
+      "derived_from": "CLI (main entry point)"
+    },
+    {
+      "name": "CompileCommand",
+      "type": "process",
+      "description": "compile command (takes input text or file, outputs blueprint); self-compile command (compiles Motherlabs itself)",
+      "derived_from": "CompileCommand"
+    },
+    {
+      "name": "CorpusCommand",
+      "type": "process",
+      "description": "corpus command (list/query stored compilations)",
+      "derived_from": "CorpusCommand"
+    },
+    {
+      "name": "ConfigCommand",
+      "type": "process",
+      "description": "config command (set provider, model, etc.)",
+      "derived_from": "ConfigCommand"
+    },
+    {
+      "name": "OutputFormatter",
+      "type": "subsystem",
+      "description": "formats output",
+      "derived_from": "OutputFormatter (JSON, YAML, markdown)",
+      "sub_blueprint": {
+        "components": [
+          {
+            "name": "JSON",
+            "type": "entity",
+            "description": "JSON formatter",
+            "derived_from": "OutputFormatter [SUBSYSTEM: JSON, YAML, markdown]"
+          },
+          {
+            "name": "YAML",
+            "type": "entity",
+            "description": "YAML formatter",
+            "derived_from": "OutputFormatter [SUBSYSTEM: JSON, YAML, markdown]"
+          },
+          {
+            "name": "markdown",
+            "type": "entity",
+            "description": "markdown formatter",
+            "derived_from": "OutputFormatter [SUBSYSTEM: JSON, YAML, markdown]"
+          }
+        ],
+        "relationships": [],
+        "constraints": []
+      }
+    },
+    {
+      "name": "ProgressIndicator",
+      "type": "process",
+      "description": "shows compilation progress",
+      "derived_from": "ProgressIndicator (shows compilation progress)"
+    }
+  ],
+  "relationships": [
+    {
+      "from": "CLI",
+      "to": "CompileCommand",
+      "type": "triggers",
+      "description": "CLI dispatches/triggers commands based on user input",
+      "derived_from": "CLI triggers CompileCommand or CorpusCommand or ConfigCommand."
+    },
+    {
+      "from": "CLI",
+      "to": "CorpusCommand",
+      "type": "triggers",
+      "description": "CLI dispatches/triggers commands based on user input",
+      "derived_from": "CLI triggers CompileCommand or CorpusCommand or ConfigCommand."
+    },
+    {
+      "from": "CLI",
+      "to": "ConfigCommand",
+      "type": "triggers",
+      "description": "CLI dispatches/triggers commands based on user input",
+      "derived_from": "CLI triggers CompileCommand or CorpusCommand or ConfigCommand."
+    },
+    {
+      "from": "CompileCommand",
+      "to": "OutputFormatter",
+      "type": "depends_on",
+      "description": "CompileCommand uses OutputFormatter for output",
+      "derived_from": "CompileCommand uses OutputFormatter."
+    },
+    {
+      "from": "CompileCommand",
+      "to": "ProgressIndicator",
+      "type": "depends_on",
+      "description": "CompileCommand uses ProgressIndicator during processing",
+      "derived_from": "CompileCommand uses ProgressIndicator."
+    }
+  ],
+  "constraints": [],
+  "unresolved": [
+    "stored compilations queried by CorpusCommand",
+    "settings persisted by ConfigCommand",
+    "Motherlabs as the overall compiler",
+    "Missing canonical relationships: 1 of 1"
+  ]
+}

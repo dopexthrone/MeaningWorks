@@ -1,0 +1,78 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --brand: #6366F1;
+  --trust-safe: #10B981;
+  --trust-warn: #F59E0B;
+  --trust-danger: #EF4444;
+  --bg-primary: #0F1117;
+  --bg-secondary: #1A1D2E;
+  --bg-tertiary: #242840;
+  --border: #2D3154;
+  --text-primary: #F1F5F9;
+  --text-secondary: #94A3B8;
+  --text-muted: #64748B;
+}
+
+@layer base {
+  body {
+    @apply bg-[var(--bg-primary)] text-[var(--text-primary)] antialiased;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-[var(--bg-secondary)] border border-[var(--border)] rounded-card p-6;
+  }
+
+  .btn-primary {
+    @apply bg-brand-500 hover:bg-brand-600 text-white font-medium px-4 py-2 rounded-btn
+      transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply bg-[var(--bg-tertiary)] hover:bg-[var(--border)] text-[var(--text-primary)] font-medium
+      px-4 py-2 rounded-btn border border-[var(--border)] transition-colors;
+  }
+
+  .input {
+    @apply bg-[var(--bg-tertiary)] border border-[var(--border)] rounded-btn px-4 py-2
+      text-[var(--text-primary)] placeholder-[var(--text-muted)]
+      focus:outline-none focus:border-brand-500 focus:ring-1 focus:ring-brand-500 transition-colors;
+  }
+
+  .sidebar-link {
+    @apply flex items-center gap-3 px-4 py-2.5 rounded-btn text-[var(--text-secondary)]
+      hover:text-[var(--text-primary)] hover:bg-[var(--bg-tertiary)] transition-colors text-sm;
+  }
+
+  .sidebar-link-active {
+    @apply text-[var(--text-primary)] bg-[var(--bg-tertiary)] border-l-2 border-brand-500;
+  }
+}
+
+/* React Flow overrides */
+.react-flow__background {
+  background-color: var(--bg-primary) !important;
+}
+
+.react-flow__controls button {
+  background-color: var(--bg-secondary) !important;
+  border-color: var(--border) !important;
+  color: var(--text-primary) !important;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-primary); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+/* Shiki code blocks */
+pre.shiki {
+  @apply rounded-btn p-4 text-sm overflow-x-auto;
+  background-color: var(--bg-tertiary) !important;
+}

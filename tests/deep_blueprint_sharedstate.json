@@ -1,0 +1,143 @@
+{
+  "components": [
+    {
+      "name": "SharedState",
+      "type": "subsystem",
+      "description": "central data structure that all agents read from and write to during specification excavation. It must support concurrent access, version tracking, and audit snapshots.",
+      "derived_from": "# SharedState Component - Deep Specification SharedState is the central data structure that all agents read from and write to during specification excavation. It must support concurrent access, version tracking, and audit snapshots.",
+      "sub_blueprint": {
+        "components": [
+          {
+            "name": "K",
+            "type": "entity",
+            "description": "Dict mapping names to confirmed facts/specs",
+            "derived_from": "- K (Known): Dict mapping names to confirmed facts/specs"
+          },
+          {
+            "name": "U",
+            "type": "entity",
+            "description": "List of unresolved questions/ambiguities",
+            "derived_from": "- U (Unknown): List of unresolved questions/ambiguities"
+          },
+          {
+            "name": "O",
+            "type": "entity",
+            "description": "Set of domain terms and their definitions",
+            "derived_from": "- O (Ontology): Set of domain terms and their definitions"
+          },
+          {
+            "name": "P",
+            "type": "entity",
+            "description": "List of perspective objects with name, priorities, blind_spots",
+            "derived_from": "- P (Personas): List of perspective objects with name, priorities, blind_spots"
+          },
+          {
+            "name": "H",
+            "type": "entity",
+            "description": "List of Message objects in temporal order",
+            "derived_from": "- H (History): List of Message objects in temporal order"
+          },
+          {
+            "name": "C",
+            "type": "entity",
+            "description": "ConfidenceVector tracking per-fact confidence scores",
+            "derived_from": "- C (Confidence): ConfidenceVector tracking per-fact confidence scores"
+          }
+        ],
+        "relationships": [],
+        "constraints": []
+      }
+    },
+    {
+      "name": "Message",
+      "type": "entity",
+      "description": "Message objects stored in H (History)",
+      "derived_from": "List of Message objects in temporal order"
+    },
+    {
+      "name": "ConfidenceVector",
+      "type": "entity",
+      "description": "ConfidenceVector tracking per-fact confidence scores in C",
+      "derived_from": "ConfidenceVector tracking per-fact confidence scores"
+    }
+  ],
+  "relationships": [
+    {
+      "from": "SharedState",
+      "to": "SharedState.K",
+      "type": "contains",
+      "description": "SharedState contains K",
+      "derived_from": "SharedState contains: - K (Known): Dict mapping names to confirmed facts/specs"
+    },
+    {
+      "from": "SharedState",
+      "to": "SharedState.U",
+      "type": "contains",
+      "description": "SharedState contains U",
+      "derived_from": "SharedState contains: - U (Unknown): List of unresolved questions/ambiguities"
+    },
+    {
+      "from": "SharedState",
+      "to": "SharedState.O",
+      "type": "contains",
+      "description": "SharedState contains O",
+      "derived_from": "SharedState contains: - O (Ontology): Set of domain terms and their definitions"
+    },
+    {
+      "from": "SharedState",
+      "to": "SharedState.P",
+      "type": "contains",
+      "description": "SharedState contains P",
+      "derived_from": "SharedState contains: - P (Personas): List of perspective objects with name, priorities, blind_spots"
+    },
+    {
+      "from": "SharedState",
+      "to": "SharedState.H",
+      "type": "contains",
+      "description": "SharedState contains H",
+      "derived_from": "SharedState contains: - H (History): List of Message objects in temporal order"
+    },
+    {
+      "from": "SharedState",
+      "to": "SharedState.C",
+      "type": "contains",
+      "description": "SharedState contains C",
+      "derived_from": "SharedState contains: - C (Confidence): ConfidenceVector tracking per-fact confidence scores"
+    },
+    {
+      "from": "SharedState.H",
+      "to": "Message",
+      "type": "contains",
+      "description": "H contains Message objects",
+      "derived_from": "- H (History): List of Message objects in temporal order"
+    },
+    {
+      "from": "SharedState.C",
+      "to": "ConfidenceVector",
+      "type": "contains",
+      "description": "C contains ConfidenceVector",
+      "derived_from": "- C (Confidence): ConfidenceVector tracking per-fact confidence scores"
+    },
+    {
+      "from": "SharedState",
+      "to": "SharedState",
+      "type": "snapshots",
+      "description": "snapshot() returns immutable copy of SharedState for audit",
+      "derived_from": "snapshot() -> Dict: Return immutable copy for audit"
+    }
+  ],
+  "constraints": [
+    {
+      "description": "must support concurrent access, version tracking, and audit snapshots",
+      "applies_to": [
+        "SharedState"
+      ],
+      "derived_from": "It must support concurrent access, version tracking, and audit snapshots."
+    }
+  ],
+  "unresolved": [
+    "Incomplete method name: add_messa",
+    "Specific agent names referenced as 'all agents' but not explicitly listed",
+    "Details of methods like __init__(input_text: str), add_known(name: str, value: Any, source: str), add_unknown(question: str), resolve_unknown(index: int, resolution: str)"
+  ]
+}
