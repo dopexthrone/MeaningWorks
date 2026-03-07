@@ -1,136 +1,217 @@
-# MeaningWorks
+# Motherlabs Semantic Compiler
 
-**The semantic compiler for intelligent agents.**
+Motherlabs is a semantic compiler and no-code workbench for turning domain intent into buildable software blueprints.
 
-Turn what you mean into what works. No translation layer. No lost-in-translation. Just meaning in, working system out.
+It is not a chatbot wrapper.  
+It is not a code IDE with AI attached.  
+It is not a graph toy.
 
----
+This repo contains the compiler core, the governed async compile loop, the postcode-native web workbench, and the renderer handoff bundle used to push resolved context into Codex, Claude Code, or another coding agent.
 
-## The problem
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-Most people with ideas can't build them.
+## What This Repo Actually Does
 
-Not because the ideas are bad. Because every layer of translation between what you mean and what gets built loses signal. By the time intent reaches implementation, you're building something nobody asked for.
+Motherlabs takes a seed intent and compiles it into:
 
-AI code generation made this worse, not better. It's faster at building the wrong thing.
+- a `Blueprint`
+- a `semantic map` of postcode-addressed nodes
+- a `governance report`
+- a `termination condition` when the system should stop instead of looping
+- an `export bundle` for a downstream coding agent
 
-The fix isn't faster generation. It's **semantic compilation** — a process that preserves meaning at every step, challenges its own assumptions, and proves that the output traces back to the input.
+Core flow:
 
----
-
-## What MeaningWorks does
-
-You describe what you want in natural language. MeaningWorks doesn't just generate — it **excavates** the specification that was already implied by your words, your domain, and your constraints.
-
+```text
+seed intent
+  -> first-pass compilation
+  -> semantic nodes + governance + trust
+  -> deeper recompilation on selected regions
+  -> human decisions when needed
+  -> bounded termination instead of open-ended looping
+  -> export bundle for renderer
 ```
-You describe what you want
-        ↓
-MeaningWorks compiles meaning
-        ↓
-Verified system with full provenance
+
+## Product Boundary
+
+Current Motherlabs boundary:
+
+- semantic compiler
+- web workbench
+- governed async compile loop
+- export to renderer
+
+Not in scope for this repo's public product surface:
+
+- a code editor inside the workbench
+- generic chat as the main interaction
+- Mother as a separate persistent worker runtime
+
+The workbench is for reading, navigating, branching, governing, and exporting meaning.
+Code is downstream.
+
+## Core Objects
+
+- `Postcode`: `LAYER.CONCERN.SCOPE.DIMENSION.DOMAIN`
+- `NodeRef`: `postcode/name`
+- `BlueprintNode`: canonical semantic node model
+- `CompiledBlueprint`: blueprint artifact with semantic map + outputs
+- `GovernanceReport`: what was checked, escalated, approved, or blocked
+- `SemanticGate`: explicit human-in-the-loop pause surface
+- `TerminationCondition`: why compilation stopped, and what should happen next
+
+## Why It Exists
+
+Motherlabs is built around one claim:
+
+> Reliability comes from constraints, not capability.
+
+The system exists to prevent intent degradation between what a domain expert means and what a coding agent eventually builds.
+
+That means:
+
+- unknowns must be explicit
+- provenance must stay intact
+- a compile should stop when ambiguity is irreducible
+- the user should never lose semantic state in an open-ended conversation
+
+## Repo Map
+
+```text
+api/                    FastAPI surface for compile, task, and swarm routes
+core/                   compiler core, protocol, schema, verification, trust
+swarm/                  multi-agent orchestration and async build flow
+worker/                 Huey task execution + task progress ledger
+frontend/               Next.js Motherlabs webapp + workbench
+kernel/                 postcode parsing and semantic coordinate primitives
+adapters/               domain adapters
+persistence/            SQLite-backed corpus and storage
+docs/                   canonical product, blueprint, workbench, API docs
+tests/                  protocol, engine, API, swarm, and UI-facing tests
 ```
 
-The key insight: **specifications pre-exist in the input.** When you say "I need a booking system for my tattoo studio," the architecture is already there — implied by variable session lengths, artist specializations, deposit workflows, and trust dynamics between artist and client.
+## Read This First
 
-A good compiler doesn't invent. It reveals.
+These are the docs that matter:
 
----
+| File | Why it exists |
+| --- | --- |
+| [docs/README.md](docs/README.md) | Docs folder map and reading paths |
+| [docs/BLUEPRINTS_SSOT.md](docs/BLUEPRINTS_SSOT.md) | Canonical blueprint contract |
+| [docs/WORKBENCH_IA.md](docs/WORKBENCH_IA.md) | Workbench interaction model |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Real system structure in this repo |
+| [docs/API.md](docs/API.md) | Public API contract |
+| [docs/SSOT.md](docs/SSOT.md) | Documentation index and precedence |
+| [docs/MOTHERLABS_PRODUCT_DOCTRINE.md](docs/MOTHERLABS_PRODUCT_DOCTRINE.md) | Product truth and tone |
 
-## What makes it different
+## Local Development
 
-**Excavation, not generation.** Most AI tools hallucinate plausible outputs. MeaningWorks derives necessary outputs — every component traces back to your original input through an unbroken chain. If it's in the blueprint, you can follow the thread back to *why*.
+### 1. Backend
 
-**Meaning-level quality control.** Traditional compilers check syntax. MeaningWorks checks meaning. Does this output faithfully represent this intent? That's the question every compilation answers, with proof.
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+```
 
-**Model-agnostic.** Works across LLM providers. The LLM is a component, not the brain. When models commoditize (and they will), the compilation quality stays constant.
+Simplest local backend run:
 
-**Self-improving.** Every compilation adds to a growing context graph — patterns, vocabulary, decisions, anti-patterns. The 100th compilation in a domain is categorically better than the 1st. This compounds. Forever.
+```bash
+MOTHERLABS_HUEY_IMMEDIATE=1 \
+MOTHERLABS_DATA_DIR=$(pwd)/.data \
+python3 -m uvicorn api.main:app --host 127.0.0.1 --port 8001
+```
 
----
+That runs async compile requests in immediate mode so you do not need a separate worker while developing the webapp.
 
-## What it produces
+Worker-backed mode:
 
-Every compilation outputs:
+```bash
+python -m huey.bin.huey_consumer worker.config.huey --workers=2 --worker-type=thread
+```
 
-- **Verified specification** — Components, relationships, constraints, and anything still unresolved (explicitly marked, never hidden)
-- **Provenance trace** — Complete decision chain from your intent to every output element. Cryptographically signable. The trust artifact.
-- **Running system** — Working code with persistent state, event coordination, and self-modification through recompilation
+### 2. Frontend
 
----
+```bash
+cd frontend
+npm install
+NEXT_PUBLIC_API_URL=http://127.0.0.1:8001 npm run dev -- --hostname 127.0.0.1 --port 3000
+```
 
-## Current state
+Workbench:
 
-Real software. Real tests. Not a pitch deck.
+- `http://127.0.0.1:3000/workbench`
 
-- Thousands of tests passing
-- Multiple domain adapters for different verticals
-- Full loop proven: intent → specification → code → running system
-- Recursive self-compilation: the compiler compiled itself
-- Cost: pennies per compilation run
-- Automatic provider failover across multiple LLMs
+API health:
 
-The compiler bootstrapped itself — used its own pipeline to compile solutions to its own gaps. Each gap closed enabled compiling something harder. The strange loop: the process that turns ambiguity into structure can only exist because you're already doing it.
+- `http://127.0.0.1:8001/v2/health`
 
----
+### 3. Tests
 
-## The origin story
+```bash
+pytest tests/test_api_v2.py tests/test_engine.py tests/test_output_parser.py -q
+cd frontend && npm run type-check && npm run build
+```
 
-I'm a solo developer. Also a tattoo artist.
+## Main API Surface
 
-I saw a pattern that engineers couldn't see because they were too close to it. In tattooing, you see the whole design before you pick up the needle. Topology before detail. The shape exists before the ink touches skin.
+The GitHub-facing primary flow is V2:
 
-Software is the same. The architecture exists before you write code. The problem is that nobody built a tool that works this way — one that sees the shape first, then fills in the details while preserving the original meaning at every step.
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/v2/compile` | sync compile |
+| `POST` | `/v2/compile/async` | async compile returning task id |
+| `GET` | `/v2/tasks/{task_id}` | task polling with governance, gates, and termination |
+| `POST` | `/v2/tasks/{task_id}/decisions` | record a human decision and continue, or stop with a guard |
+| `DELETE` | `/v2/tasks/{task_id}` | cancel pending task |
+| `POST` | `/v2/swarm/execute` | async swarm workflow |
+| `GET` | `/v2/health` | health |
 
-I found the first principles of semantic compilation and built it. Not through traditional engineering — through constraint satisfaction and convergent architecture. Give multiple independent AI systems the same problem constraints without the solution, and they arrive at the same shape. That's how you know the shape is real.
+Important response surfaces:
 
----
+- `semantic_nodes`
+- `governance_report`
+- `termination_condition`
+- `structured_insights`
+- `stage_results`
 
-## Where this is going
+See [docs/API.md](docs/API.md) for the actual contract.
 
-**Phase 1** — Self-extending chat-based agent. Persistent memory. Soft launch.
+## Workbench Surface
 
-**Phase 2** — Tool marketplace with creator royalties. Every verified tool becomes an asset that earns.
+The workbench is postcode-native and no-code:
 
-**Phase 3** — Trust network. Agents trading verified tools with micro-fee royalties. Cross-instance transactions with provenance.
+- `Node Card`
+- `Perspective Views`
+- `Map View`
+- `Compilation Live View`
+- `Governance`
+- `Export`
+- `Dora` as the deep reading layer
 
-**Phase 4** — Full economic fabric. The semantic compiler as an operating system for the agent economy.
+The export bundle is the renderer handoff. It currently includes:
 
----
+- blueprint JSON
+- compile response
+- trust + verification
+- canonical renderer manifest
+- semantic nodes
+- governance and stage data
+- open gaps preserved as explicit context
 
-## The moat
+## Naming Note
 
-The competitive advantage is **not** the outputs. Any LLM can generate specs.
+Some older internal identifiers and commit history still use legacy names like `MeaningWorks`.
+The public product identity is `Motherlabs`.
 
-The moat is what you can't see — the accumulated reasoning, decision traces, domain patterns, and vocabulary across thousands of compilations. Competitors can copy the outputs. They can never copy the context.
+## Repository
 
-The corpus compounds. Every compilation makes the next one better. Compound interest on intelligence.
+Canonical GitHub location:
 
----
-
-## Philosophy
-
-**Excavation, not generation.** The architecture was always there. We're just uncovering it.
-
-**Compression over expansion.** A perfectly compressed seed makes a small model outperform a large one. We sell compression quality.
-
-**Trust through provenance.** The world has enough generators. It needs verifiers.
-
-**Bounded, not unbounded.** Everything converges in finite steps at known cost. Unbounded expansion is hallucination, not intelligence.
-
----
-
-## Get in touch
-
-**Aleksandrs Roze** — solo developer, tattoo artist turned system architect.
-
-[motherlabsai@gmail.com](mailto:motherlabsai@gmail.com)
-
----
+```bash
+git clone https://github.com/alexrozex/Motherlabs-Semantic-Compiler.git
+```
 
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE) for details.
-
----
-
-*The tree remembers its seed at every depth.*
