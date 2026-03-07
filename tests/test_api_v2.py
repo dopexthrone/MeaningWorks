@@ -6,7 +6,9 @@ Phase D: V2 API + Platform Layer
 
 import pytest
 import json
+import asyncio
 from unittest.mock import patch, MagicMock
+from starlette.requests import Request
 
 # Import models directly (no FastAPI server needed)
 from api.v2.models import (
@@ -22,9 +24,11 @@ from api.v2.models import (
     V2MetricsResponse,
     V2CompileTreeRequest,
     V2MaterializeRequest,
+    TaskDecisionRequest,
 )
 from motherlabs_platform.metering import MeteringTracker, DomainMetrics
 from core.adapter_registry import get_adapter, list_adapters, clear_registry, register_adapter
+from core.blueprint_protocol import make_node_ref
 from core.trust import compute_trust_indicators, serialize_trust_indicators
 
 
@@ -146,6 +150,96 @@ class TestV2CompileResponse:
         r = V2CompileResponse(success=False, error="Provider error")
         assert not r.success
         assert r.error == "Provider error"
+
+    def test_glass_box_fields(self):
+        r = V2CompileResponse(
+            success=True,
+            structured_insights=[{"text": "Identified: Auth", "category": "discovery"}],
+            difficulty={"unknown_count": 1},
+            stage_results=[{"stage": "intent", "success": True, "errors": [], "warnings": [], "retries": 0}],
+            stage_timings={"intent": 0.4},
+            retry_counts={"intent": 0},
+        )
+        assert r.structured_insights[0]["text"] == "Identified: Auth"
+        assert r.difficulty["unknown_count"] == 1
+        assert r.stage_results[0].stage == "intent"
+        assert r.stage_timings["intent"] == 0.4
+
+    def test_semantic_nodes_field(self):
+        r = V2CompileResponse(
+            success=True,
+            semantic_nodes=[
+                {
+                    "id": "node-1",
+                    "postcode": "INT.SEM.APP.WHY.SFT",
+                    "primitive": "purpose",
+                    "description": "Compile intent into a buildable plan.",
+                    "notes": [],
+                    "fill_state": "F",
+                    "confidence": 0.98,
+                    "status": "promoted",
+                    "version": 1,
+                    "created_at": "2026-03-07T22:00:00Z",
+                    "updated_at": "2026-03-07T22:00:00Z",
+                    "last_verified": "2026-03-07T22:00:00Z",
+                    "freshness": {"decay_rate": 0.001, "floor": 0.6, "stale_after": 90},
+                    "parent": None,
+                    "children": [],
+                    "connections": [],
+                    "references": {
+                        "read_before": [],
+                        "read_after": [],
+                        "see_also": [],
+                        "deep_dive": [],
+                        "warns": [],
+                    },
+                    "provenance": {
+                        "source_ref": ["user:intake"],
+                        "agent_id": "Intent",
+                        "run_id": "run-1",
+                        "timestamp": "2026-03-07T22:00:00Z",
+                        "human_input": True,
+                    },
+                    "token_cost": 0,
+                    "constraints": [],
+                    "constraint_source": [],
+                }
+            ],
+        )
+        assert r.semantic_nodes[0].primitive == "purpose"
+        assert r.semantic_nodes[0].layer == "INT"
+
+    def test_termination_condition_field(self):
+        r = V2CompileResponse(
+            success=True,
+            termination_condition={
+                "status": "stalled",
+                "reason": "semantic_progress_stalled",
+                "message": "No semantic progress after re-synthesis.",
+                "next_action": "Narrow the scope.",
+            },
+        )
+        assert r.termination_condition["reason"] == "semantic_progress_stalled"
+
+    def test_governance_report_field(self):
+        r = V2CompileResponse(
+            success=True,
+            governance_report={
+                "total_nodes": 2,
+                "promoted": 1,
+                "quarantined": [],
+                "escalated": [{"postcode": "INT.SEM.APP.WHY.SFT", "question": "Clarify scope?"}],
+                "axiom_violations": [],
+                "human_decisions": [],
+                "coverage": 72.5,
+                "anti_goals_checked": 0,
+                "compilation_depth": {"label": "demo", "gaps_remaining": 1},
+                "cost_report": {"actual_usd": 0.12, "halted": False},
+            },
+        )
+        assert r.governance_report is not None
+        assert r.governance_report.coverage == 72.5
+        assert r.governance_report.compilation_depth.label == "demo"
 
 
 class TestUsageResponse:
@@ -431,3 +525,830 @@ class TestBuildTrustResponse:
         )
         assert isinstance(trust, TrustResponse)
         assert trust.overall_score >= 0
+
+
+class TestSwarmResultNormalization:
+    def test_preserves_glass_box_fields_and_yaml(self):
+        from api.v2.routes import _normalize_swarm_compile_result
+
+        raw = {
+            "success": True,
+            "total_duration_s": 3.2,
+            "benchmark": {"composite_pct": 88.0},
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "blueprint": {
+                    "components": [
+                        {
+                            "name": "AuthService",
+                            "type": "entity",
+                            "description": "Handles auth",
+                            "derived_from": "Build auth",
+                            "attributes": {},
+                            "methods": [],
+                            "validation_rules": [],
+                        }
+                    ],
+                    "relationships": [],
+                    "constraints": [],
+                    "core_need": "Build auth",
+                    "unresolved": [],
+                },
+                "verification": {"completeness": {"score": 80}},
+                "context_graph": {"keywords": ["auth"]},
+                "trust": {"overall_score": 86.0, "verification_badge": "verified"},
+                "generated_code": {"AuthService": "class AuthService: pass"},
+                "project_manifest": {
+                    "project_name": "build_auth",
+                    "file_contents": {"auth_service.py": "class AuthService: pass"},
+                },
+                "compile_result": {
+                    "dimensional_metadata": {"coverage": {"entity": 0.92}},
+                    "interface_map": {"AuthService": {"methods": []}},
+                    "structured_insights": [
+                        {"text": "Identified: AuthService", "category": "discovery", "stage": "entity_extraction"},
+                    ],
+                    "difficulty": {"unknown_count": 1, "irritation_depth": 0.25},
+                    "stage_results": [
+                        {"stage": "intent", "success": True, "errors": [], "warnings": [], "retries": 0},
+                        {"stage": "verification", "success": False, "errors": ["missing rollback"], "warnings": [], "retries": 1},
+                    ],
+                    "stage_timings": {"intent": 0.3, "verification": 1.7},
+                    "retry_counts": {"verification": 1},
+                },
+                "stub_report": {"stub_count": 0},
+            },
+        }
+
+        normalized = _normalize_swarm_compile_result(raw)
+
+        assert normalized["structured_insights"][0]["text"] == "Identified: AuthService"
+        assert normalized["difficulty"]["unknown_count"] == 1
+        assert normalized["dimensional_metadata"]["coverage"]["entity"] == 0.92
+        assert normalized["interface_map"]["AuthService"]["methods"] == []
+        assert normalized["stage_results"][1]["stage"] == "verification"
+        assert normalized["stage_results"][1]["errors"] == ["missing rollback"]
+        assert normalized["stage_timings"]["verification"] == 1.7
+        assert normalized["retry_counts"]["verification"] == 1
+        assert normalized["project_name"] == "build_auth"
+        assert normalized["semantic_nodes"][0]["primitive"] == "purpose"
+        auth_ref = make_node_ref("STR.ENT.APP.WHAT.SFT", "AuthService")
+        auth_node = next(node for node in normalized["semantic_nodes"] if node["primitive"] == "AuthService")
+        assert auth_node["references"]["read_before"] == ["INT.SEM.APP.WHY.SFT/purpose"]
+        assert make_node_ref(auth_node["postcode"], auth_node["primitive"]) == auth_ref
+        assert normalized["governance_report"]["total_nodes"] == 2
+        assert normalized["governance_report"]["promoted"] == 2
+        assert normalized["governance_report"]["coverage"] > 0
+        assert "MANIFEST.yaml" in normalized["yaml_output"]
+
+    def test_normalize_swarm_compile_result_prefers_native_blueprint_semantic_nodes(self):
+        from api.v2.routes import _normalize_swarm_compile_result
+
+        raw = {
+            "success": True,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "blueprint": {
+                    "components": [
+                        {
+                            "name": "AuthService",
+                            "type": "entity",
+                            "description": "Handles auth",
+                            "derived_from": "Build auth",
+                            "attributes": {},
+                            "methods": [],
+                            "validation_rules": [],
+                        }
+                    ],
+                    "relationships": [],
+                    "constraints": [],
+                    "core_need": "Build auth",
+                    "unresolved": [],
+                    "semantic_nodes": [
+                        {
+                            "postcode": "EXC.FNC.APP.HOW.SFT",
+                            "primitive": "authenticate",
+                            "description": "Validate credentials and create a session.",
+                            "fill_state": "F",
+                            "confidence": 0.94,
+                            "connections": ["STR.ENT.APP.WHAT.SFT/authservice"],
+                            "source_ref": ["Build auth"],
+                        }
+                    ],
+                },
+                "verification": {"completeness": {"score": 80}},
+                "context_graph": {"keywords": ["auth"]},
+                "trust": {"overall_score": 86.0, "verification_badge": "verified"},
+                "compile_result": {},
+            },
+        }
+
+        normalized = _normalize_swarm_compile_result(raw)
+
+        refs = {
+            make_node_ref(node["postcode"], node["primitive"])
+            for node in normalized["semantic_nodes"]
+        }
+        assert "EXC.FNC.APP.HOW.SFT/authenticate" in refs
+
+    def test_normalize_swarm_compile_result_derives_termination_condition(self):
+        from api.v2.routes import _normalize_swarm_compile_result
+
+        raw = {
+            "success": False,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "blueprint": {"components": []},
+                "verification": {},
+                "context_graph": {},
+                "trust": {},
+                "compile_result": {
+                    "success": True,
+                    "blocking_escalations": [
+                        {
+                            "postcode": "STR.ENT.APP.WHAT.SFT",
+                            "question": "Which provider fallback should AuthService use?",
+                            "options": ["Anthropic", "OpenAI"],
+                        }
+                    ],
+                },
+            },
+        }
+
+        normalized = _normalize_swarm_compile_result(raw)
+        assert normalized["termination_condition"]["reason"] == "human_decision_required"
+
+
+class TestTaskDecisionLedger:
+    def test_record_task_decision_persists_progress(self, tmp_path, monkeypatch):
+        from api.v2.routes import record_task_decision
+        from worker import progress as progress_module
+
+        monkeypatch.setattr(progress_module, "_PROGRESS_DB", str(tmp_path / "progress.db"))
+        raw_request = Request({"type": "http", "headers": []})
+
+        response = asyncio.run(record_task_decision(
+            "task-123",
+            TaskDecisionRequest(
+                postcode="INT.SEM.APP.WHY.SFT",
+                question="Lock the scope?",
+                answer="yes",
+                timestamp="2026-03-07T22:30:00Z",
+            ),
+            raw_request,
+        ))
+
+        saved = progress_module.read_progress("task-123")
+
+        assert response.saved is True
+        assert saved is not None
+        assert saved["human_decisions"][0]["answer"] == "yes"
+        assert saved["human_decisions"][0]["postcode"] == "INT.SEM.APP.WHY.SFT"
+        assert response.next_task_id is None
+
+    def test_get_task_status_returns_ledger_on_complete(self, tmp_path, monkeypatch):
+        from api.v2.routes import get_task_status
+        from worker import progress as progress_module
+
+        monkeypatch.setattr(progress_module, "_PROGRESS_DB", str(tmp_path / "progress.db"))
+
+        raw = {
+            "success": True,
+            "total_duration_s": 2.1,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "blueprint": {
+                    "components": [
+                        {
+                            "name": "AuthService",
+                            "type": "entity",
+                            "description": "Handles auth",
+                            "derived_from": "Build auth",
+                            "attributes": {},
+                            "methods": [],
+                            "validation_rules": [],
+                        }
+                    ],
+                    "relationships": [],
+                    "constraints": [],
+                    "core_need": "Build auth",
+                    "unresolved": ["AuthService needs provider fallback"],
+                },
+                "verification": {"completeness": {"score": 80}},
+                "context_graph": {"keywords": ["auth"]},
+                "trust": {"overall_score": 86.0, "verification_badge": "verified"},
+                "compile_result": {},
+            },
+        }
+
+        with patch("worker.config.huey.result", return_value=raw):
+            response = asyncio.run(get_task_status("task-456"))
+
+        assert response.status == "complete"
+        assert response.progress is not None
+        assert len(response.progress["escalations"]) >= 1
+
+    def test_get_task_status_returns_awaiting_decision_for_fracture(self, tmp_path, monkeypatch):
+        from api.v2.routes import get_task_status
+        from worker import progress as progress_module
+
+        monkeypatch.setattr(progress_module, "_PROGRESS_DB", str(tmp_path / "progress.db"))
+
+        raw = {
+            "success": False,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "request_type": "full_build",
+                "blueprint": {},
+                "verification": {},
+                "context_graph": {},
+                "trust": {},
+                "compile_result": {
+                    "success": False,
+                    "error": "Clarification required before compilation can continue",
+                    "fracture": {
+                        "stage": "interrogation",
+                        "competing_configs": ["Public app", "Internal tool"],
+                        "collapsing_constraint": "Which direction should I take?",
+                        "agent": "Interrogation",
+                    },
+                },
+            },
+        }
+
+        with patch("worker.config.huey.result", return_value=raw):
+            response = asyncio.run(get_task_status("task-await"))
+
+        assert response.status == "awaiting_decision"
+        assert response.progress is not None
+        assert response.progress["escalations"][0]["question"] == "Which direction should I take?"
+        assert response.progress["escalations"][0]["options"] == ["Public app", "Internal tool"]
+
+    def test_record_task_decision_spawns_continuation_for_fracture(self, tmp_path, monkeypatch):
+        from api.v2.routes import record_task_decision
+        from worker import progress as progress_module
+
+        monkeypatch.setattr(progress_module, "_PROGRESS_DB", str(tmp_path / "progress.db"))
+
+        raw = {
+            "success": False,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "provider": "claude",
+                "request_type": "full_build",
+                "cost_cap_usd": 5.0,
+                "blueprint": {},
+                "verification": {},
+                "context_graph": {},
+                "trust": {},
+                "compile_result": {
+                    "success": False,
+                    "error": "Clarification required before compilation can continue",
+                    "fracture": {
+                        "stage": "interrogation",
+                        "competing_configs": ["Public app", "Internal tool"],
+                        "collapsing_constraint": "Which direction should I take?",
+                        "agent": "Interrogation",
+                    },
+                },
+            },
+        }
+        raw_request = Request({"type": "http", "headers": []})
+
+        with patch("worker.config.huey.result", return_value=raw), patch(
+            "worker.swarm_tasks.swarm_execute_task",
+            return_value=MagicMock(id="task-next"),
+        ) as mock_resume:
+            response = asyncio.run(record_task_decision(
+                "task-await",
+                TaskDecisionRequest(
+                    postcode="INT.SEM.APP.IF.SFT",
+                    question="Which direction should I take?",
+                    answer="Internal tool",
+                ),
+                raw_request,
+            ))
+
+        assert response.saved is True
+        assert response.next_task_id == "task-next"
+        resume_intent = mock_resume.call_args.kwargs["intent"]
+        assert "Internal tool" in resume_intent
+        assert "Continue compilation with this decision treated as locked context." in resume_intent
+
+    def test_get_task_status_returns_awaiting_decision_for_blocking_semantic_gate(self, tmp_path, monkeypatch):
+        from api.v2.routes import get_task_status
+        from worker import progress as progress_module
+
+        monkeypatch.setattr(progress_module, "_PROGRESS_DB", str(tmp_path / "progress.db"))
+
+        raw = {
+            "success": False,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "request_type": "full_build",
+                "blueprint": {
+                    "components": [
+                        {
+                            "name": "AuthService",
+                            "type": "entity",
+                            "description": "Handles auth",
+                            "derived_from": "Build auth",
+                            "attributes": {},
+                            "methods": [],
+                            "validation_rules": [],
+                        }
+                    ],
+                    "relationships": [],
+                    "constraints": [],
+                    "unresolved": ["AuthService needs provider fallback"],
+                },
+                "verification": {},
+                "context_graph": {"keywords": ["auth"]},
+                "trust": {"overall_score": 78.0, "gap_report": ["AuthService needs provider fallback"]},
+                "compile_result": {
+                    "success": True,
+                    "semantic_nodes": [
+                        {
+                            "id": "node-1-authservice",
+                            "postcode": "STR.ENT.APP.WHAT.SFT",
+                            "primitive": "AuthService",
+                            "description": "Handles auth",
+                            "notes": [],
+                            "fill_state": "B",
+                            "confidence": 0.62,
+                            "status": "authored",
+                            "version": 1,
+                            "created_at": "2026-03-07T22:00:00Z",
+                            "updated_at": "2026-03-07T22:00:00Z",
+                            "last_verified": "2026-03-07T22:00:00Z",
+                            "freshness": {"decay_rate": 0.001, "floor": 0.6, "stale_after": 90},
+                            "parent": None,
+                            "children": [],
+                            "connections": [],
+                            "references": {"read_before": [], "read_after": [], "see_also": [], "deep_dive": [], "warns": []},
+                            "provenance": {
+                                "source_ref": ["Build auth"],
+                                "agent_id": "Synthesis",
+                                "run_id": "swarm",
+                                "timestamp": "2026-03-07T22:00:00Z",
+                                "human_input": False,
+                            },
+                            "token_cost": 0,
+                            "constraints": [],
+                            "constraint_source": [],
+                        }
+                    ],
+                    "blocking_escalations": [
+                        {
+                            "postcode": "STR.ENT.APP.WHAT.SFT",
+                            "question": "AuthService needs provider fallback",
+                            "options": [],
+                        }
+                    ],
+                },
+            },
+        }
+
+        with patch("worker.config.huey.result", return_value=raw):
+            response = asyncio.run(get_task_status("task-blocked"))
+
+        assert response.status == "awaiting_decision"
+        assert response.progress is not None
+        assert response.progress["escalations"][0]["question"] == "AuthService needs provider fallback"
+
+    def test_get_task_status_derives_awaiting_decision_for_conflict_gate(self, tmp_path, monkeypatch):
+        from api.v2.routes import get_task_status
+        from worker import progress as progress_module
+
+        monkeypatch.setattr(progress_module, "_PROGRESS_DB", str(tmp_path / "progress.db"))
+
+        raw = {
+            "success": False,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "request_type": "full_build",
+                "blueprint": {
+                    "components": [
+                        {
+                            "name": "AuthService",
+                            "type": "entity",
+                            "description": "Handles auth",
+                            "derived_from": "Build auth",
+                            "attributes": {},
+                            "methods": [],
+                            "validation_rules": [],
+                        }
+                    ],
+                    "relationships": [],
+                    "constraints": [],
+                    "unresolved": [],
+                },
+                "verification": {},
+                "context_graph": {
+                    "keywords": ["auth"],
+                    "conflict_summary": {
+                        "unresolved": [
+                            {
+                                "topic": "AuthService: storage strategy",
+                                "category": "MISSING_INFO",
+                                "positions": {
+                                    "Entity": "Persist sessions in PostgreSQL",
+                                    "Process": "Keep sessions stateless with JWT",
+                                },
+                            }
+                        ]
+                    },
+                },
+                "trust": {"overall_score": 82.0, "gap_report": []},
+                "compile_result": {
+                    "success": True,
+                    "semantic_nodes": [
+                        {
+                            "id": "node-1-authservice",
+                            "postcode": "STR.ENT.APP.WHAT.SFT",
+                            "primitive": "AuthService",
+                            "description": "Handles auth",
+                            "notes": [],
+                            "fill_state": "P",
+                            "confidence": 0.78,
+                            "status": "authored",
+                            "version": 1,
+                            "created_at": "2026-03-07T22:00:00Z",
+                            "updated_at": "2026-03-07T22:00:00Z",
+                            "last_verified": "2026-03-07T22:00:00Z",
+                            "freshness": {"decay_rate": 0.001, "floor": 0.6, "stale_after": 90},
+                            "parent": None,
+                            "children": [],
+                            "connections": [],
+                            "references": {"read_before": [], "read_after": [], "see_also": [], "deep_dive": [], "warns": []},
+                            "provenance": {
+                                "source_ref": ["Build auth"],
+                                "agent_id": "Synthesis",
+                                "run_id": "swarm",
+                                "timestamp": "2026-03-07T22:00:00Z",
+                                "human_input": False,
+                            },
+                            "token_cost": 0,
+                            "constraints": [],
+                            "constraint_source": [],
+                        }
+                    ],
+                },
+            },
+        }
+
+        with patch("worker.config.huey.result", return_value=raw):
+            response = asyncio.run(get_task_status("task-conflict"))
+
+        assert response.status == "awaiting_decision"
+        assert response.progress is not None
+        escalation = response.progress["escalations"][0]
+        assert "storage strategy" in escalation["question"].lower()
+        assert escalation["node_ref"] == "STR.ENT.APP.WHAT.SFT/authservice"
+        assert escalation["options"] == [
+            "Persist sessions in PostgreSQL",
+            "Keep sessions stateless with JWT",
+        ]
+
+    def test_get_task_status_prefers_native_blueprint_semantic_gates(self, tmp_path, monkeypatch):
+        from api.v2.routes import get_task_status
+        from worker import progress as progress_module
+
+        monkeypatch.setattr(progress_module, "_PROGRESS_DB", str(tmp_path / "progress.db"))
+
+        raw = {
+            "success": False,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "request_type": "full_build",
+                "blueprint": {
+                    "components": [
+                        {
+                            "name": "AuthService",
+                            "type": "entity",
+                            "description": "Handles auth",
+                            "derived_from": "Build auth",
+                            "attributes": {},
+                            "methods": [],
+                            "validation_rules": [],
+                        }
+                    ],
+                    "relationships": [],
+                    "constraints": [],
+                    "unresolved": [],
+                    "semantic_gates": [
+                        {
+                            "postcode": "STR.ENT.APP.WHAT.SFT",
+                            "question": "AuthService needs provider fallback",
+                            "options": [],
+                            "node_ref": "STR.ENT.APP.WHAT.SFT/authservice",
+                            "kind": "gap",
+                            "stage": "verification",
+                        }
+                    ],
+                },
+                "verification": {},
+                "context_graph": {"keywords": ["auth"]},
+                "trust": {"overall_score": 78.0, "gap_report": []},
+                "compile_result": {
+                    "success": True,
+                },
+            },
+        }
+
+        with patch("worker.config.huey.result", return_value=raw):
+            response = asyncio.run(get_task_status("task-native-gate"))
+
+        assert response.status == "awaiting_decision"
+        escalation = response.progress["escalations"][0]
+        assert escalation["node_ref"] == "STR.ENT.APP.WHAT.SFT/authservice"
+        assert escalation["kind"] == "gap"
+
+    def test_get_task_status_hydrates_verification_semantic_gates(self, tmp_path, monkeypatch):
+        from api.v2.routes import get_task_status
+        from worker import progress as progress_module
+
+        monkeypatch.setattr(progress_module, "_PROGRESS_DB", str(tmp_path / "progress.db"))
+
+        raw = {
+            "success": False,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "request_type": "full_build",
+                "blueprint": {
+                    "components": [
+                        {
+                            "name": "AuthService",
+                            "type": "entity",
+                            "description": "Handles auth",
+                            "derived_from": "Build auth",
+                            "attributes": {},
+                            "methods": [],
+                            "validation_rules": [],
+                        }
+                    ],
+                    "relationships": [],
+                    "constraints": [],
+                    "unresolved": [],
+                },
+                "verification": {
+                    "status": "needs_work",
+                    "semantic_gates": [
+                        {
+                            "owner_component": "AuthService",
+                            "question": "Which provider fallback should AuthService use?",
+                            "kind": "semantic_conflict",
+                            "options": ["Anthropic", "OpenAI"],
+                            "stage": "verification",
+                        }
+                    ],
+                },
+                "context_graph": {"keywords": ["auth"]},
+                "trust": {"overall_score": 78.0, "gap_report": []},
+                "compile_result": {
+                    "success": True,
+                },
+            },
+        }
+
+        with patch("worker.config.huey.result", return_value=raw):
+            response = asyncio.run(get_task_status("task-verification-gate"))
+
+        assert response.status == "awaiting_decision"
+        escalation = response.progress["escalations"][0]
+        assert escalation["node_ref"] == "STR.ENT.APP.WHAT.SFT/authservice"
+        assert escalation["kind"] == "semantic_conflict"
+        assert escalation["options"] == ["Anthropic", "OpenAI"]
+
+    def test_record_task_decision_spawns_continuation_for_blocking_semantic_gate(self, tmp_path, monkeypatch):
+        from api.v2.routes import record_task_decision
+        from worker import progress as progress_module
+
+        monkeypatch.setattr(progress_module, "_PROGRESS_DB", str(tmp_path / "progress.db"))
+
+        raw = {
+            "success": False,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "provider": "claude",
+                "request_type": "full_build",
+                "cost_cap_usd": 5.0,
+                "compile_result": {
+                    "success": True,
+                    "blocking_escalations": [
+                        {
+                            "postcode": "STR.ENT.APP.WHAT.SFT",
+                            "question": "AuthService needs provider fallback",
+                            "options": [],
+                        }
+                    ],
+                },
+            },
+        }
+        raw_request = Request({"type": "http", "headers": []})
+
+        with patch("worker.config.huey.result", return_value=raw), patch(
+            "worker.swarm_tasks.swarm_execute_task",
+            return_value=MagicMock(id="task-blocked-next"),
+        ) as mock_resume:
+            response = asyncio.run(record_task_decision(
+                "task-blocked",
+                TaskDecisionRequest(
+                    postcode="STR.ENT.APP.WHAT.SFT",
+                    question="AuthService needs provider fallback",
+                    answer="Use Anthropic primary with OpenAI fallback",
+                ),
+                raw_request,
+            ))
+
+        assert response.saved is True
+        assert response.next_task_id == "task-blocked-next"
+        assert "Use Anthropic primary with OpenAI fallback" in mock_resume.call_args.kwargs["intent"]
+
+    def test_record_task_decision_carries_conflict_options_into_continuation(self, tmp_path, monkeypatch):
+        from api.v2.routes import record_task_decision
+        from worker import progress as progress_module
+
+        monkeypatch.setattr(progress_module, "_PROGRESS_DB", str(tmp_path / "progress.db"))
+
+        raw = {
+            "success": False,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "provider": "claude",
+                "request_type": "full_build",
+                "cost_cap_usd": 5.0,
+                "compile_result": {
+                    "success": True,
+                    "blocking_escalations": [
+                        {
+                            "postcode": "STR.ENT.APP.WHAT.SFT",
+                            "question": "Which direction should Motherlabs lock for AuthService: storage strategy?",
+                            "options": [
+                                "Persist sessions in PostgreSQL",
+                                "Keep sessions stateless with JWT",
+                            ],
+                        }
+                    ],
+                },
+            },
+        }
+        raw_request = Request({"type": "http", "headers": []})
+
+        with patch("worker.config.huey.result", return_value=raw), patch(
+            "worker.swarm_tasks.swarm_execute_task",
+            return_value=MagicMock(id="task-conflict-next"),
+        ) as mock_resume:
+            response = asyncio.run(record_task_decision(
+                "task-conflict",
+                TaskDecisionRequest(
+                    postcode="STR.ENT.APP.WHAT.SFT",
+                    question="Which direction should Motherlabs lock for AuthService: storage strategy?",
+                    answer="Persist sessions in PostgreSQL",
+                ),
+                raw_request,
+            ))
+
+        assert response.saved is True
+        assert response.next_task_id == "task-conflict-next"
+        resume_intent = mock_resume.call_args.kwargs["intent"]
+        assert "Persist sessions in PostgreSQL" in resume_intent
+        assert "Keep sessions stateless with JWT" in resume_intent
+
+    def test_record_task_decision_blocks_repeated_pause_cycle(self, tmp_path, monkeypatch):
+        from api.v2.routes import record_task_decision
+        from worker import progress as progress_module
+
+        monkeypatch.setattr(progress_module, "_PROGRESS_DB", str(tmp_path / "progress.db"))
+
+        repeated_pause = {
+            "postcode": "STR.ENT.APP.WHAT.SFT",
+            "question": "Which direction should Motherlabs lock for AuthService: storage strategy?",
+            "options": [
+                "Persist sessions in PostgreSQL",
+                "Keep sessions stateless with JWT",
+            ],
+        }
+        lineage_result = {
+            "success": False,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "provider": "claude",
+                "request_type": "full_build",
+                "cost_cap_usd": 5.0,
+                "compile_result": {
+                    "success": True,
+                    "blocking_escalations": [repeated_pause],
+                },
+            },
+        }
+        current = {
+            **lineage_result,
+            "state": {
+                **lineage_result["state"],
+                "previous_task_id": "task-prev-1",
+            },
+        }
+        previous_1 = {
+            **lineage_result,
+            "state": {
+                **lineage_result["state"],
+                "previous_task_id": "task-prev-2",
+            },
+        }
+        previous_2 = {
+            **lineage_result,
+            "state": {
+                **lineage_result["state"],
+                "previous_task_id": None,
+            },
+        }
+        raw_request = Request({"type": "http", "headers": []})
+
+        def _result_for(task_id, preserve=True):
+            return {
+                "task-conflict": current,
+                "task-prev-1": previous_1,
+                "task-prev-2": previous_2,
+            }.get(task_id)
+
+        with patch("worker.config.huey.result", side_effect=_result_for), patch(
+            "worker.swarm_tasks.swarm_execute_task",
+            return_value=MagicMock(id="task-conflict-next"),
+        ) as mock_resume:
+            response = asyncio.run(record_task_decision(
+                "task-conflict",
+                TaskDecisionRequest(
+                    postcode=repeated_pause["postcode"],
+                    question=repeated_pause["question"],
+                    answer="Persist sessions in PostgreSQL",
+                ),
+                raw_request,
+            ))
+
+        saved = progress_module.read_progress("task-conflict")
+
+        assert response.saved is True
+        assert response.next_task_id is None
+        assert response.termination_condition is not None
+        assert response.termination_condition["reason"] == "continuation_cycle_detected"
+        assert saved is not None
+        assert saved["termination_condition"]["reason"] == "continuation_cycle_detected"
+        mock_resume.assert_not_called()
+
+    def test_get_task_status_prefers_progress_termination_condition(self, tmp_path, monkeypatch):
+        from api.v2.routes import get_task_status
+        from worker import progress as progress_module
+
+        monkeypatch.setattr(progress_module, "_PROGRESS_DB", str(tmp_path / "progress.db"))
+
+        progress_module.write_task_termination(
+            "task-guarded",
+            {
+                "status": "stalled",
+                "reason": "continuation_cycle_detected",
+                "message": "The same semantic pause has reappeared across continuation tasks.",
+                "next_action": "Start a fresh compile.",
+            },
+        )
+
+        raw = {
+            "success": False,
+            "state": {
+                "intent": "Build auth",
+                "domain": "software",
+                "compile_result": {
+                    "success": True,
+                    "blocking_escalations": [
+                        {
+                            "postcode": "STR.ENT.APP.WHAT.SFT",
+                            "question": "Which direction should Motherlabs lock for AuthService: storage strategy?",
+                            "options": [
+                                "Persist sessions in PostgreSQL",
+                                "Keep sessions stateless with JWT",
+                            ],
+                        }
+                    ],
+                },
+            },
+        }
+
+        with patch("worker.config.huey.result", return_value=raw):
+            response = asyncio.run(get_task_status("task-guarded"))
+
+        assert response.status == "complete"
+        assert response.result is not None
+        assert response.result["termination_condition"]["reason"] == "continuation_cycle_detected"

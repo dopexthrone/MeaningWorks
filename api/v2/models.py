@@ -7,6 +7,8 @@ Phase D: V2 API + Platform Layer
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 
+from core.blueprint_protocol import BlueprintNode, GovernanceReport
+
 
 # =============================================================================
 # V2 REQUEST MODELS
@@ -143,6 +145,16 @@ class UsageResponse(BaseModel):
     adapter_version: str = "1.0"
 
 
+class StageResultResponse(BaseModel):
+    """A single provenance gate outcome from compilation."""
+
+    stage: str
+    success: bool
+    errors: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    retries: int = 0
+
+
 class V2RecompileResponse(BaseModel):
     """Response body for POST /v2/recompile."""
 
@@ -164,6 +176,9 @@ class V2CompileResponse(BaseModel):
 
     success: bool
     blueprint: Dict[str, Any] = {}
+    semantic_nodes: List[BlueprintNode] = Field(default_factory=list)
+    termination_condition: Dict[str, Any] = Field(default_factory=dict)
+    governance_report: Optional[GovernanceReport] = None
     materialized_output: Dict[str, str] = {}
 
     # THE PRODUCT
@@ -174,6 +189,14 @@ class V2CompileResponse(BaseModel):
     interface_map: Dict[str, Any] = {}
     verification: Dict[str, Any] = {}
     context_graph: Dict[str, Any] = {}
+    structured_insights: List[Dict[str, Any]] = Field(default_factory=list)
+    difficulty: Dict[str, Any] = Field(default_factory=dict)
+    stage_results: List[StageResultResponse] = Field(default_factory=list)
+    stage_timings: Dict[str, float] = Field(default_factory=dict)
+    retry_counts: Dict[str, int] = Field(default_factory=dict)
+
+    # YAML output tree
+    yaml_output: Dict[str, str] = {}
 
     # Metadata
     domain: str = "software"
@@ -189,6 +212,7 @@ class V2CompileTreeResponse(BaseModel):
     root_blueprint: Dict[str, Any] = {}
     child_blueprints: List[Dict[str, Any]] = []
     l2_synthesis: Dict[str, Any] = {}
+    yaml_output: Dict[str, str] = {}
     trust: TrustResponse = Field(default_factory=TrustResponse)
     domain: str = "software"
     error: Optional[str] = None
@@ -425,6 +449,40 @@ class TaskStatusResponse(BaseModel):
     """Response for GET /v2/tasks/{task_id} — poll compilation status."""
 
     task_id: str
-    status: str = "pending"  # pending | running | complete | error | cancelled
+    status: str = "pending"  # pending | running | awaiting_decision | complete | error | cancelled
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    progress: Optional[Dict[str, Any]] = None  # {current_stage, stage_index, total_stages, insights}
+
+
+class TaskDecisionRequest(BaseModel):
+    """Append a human decision to a task ledger."""
+
+    postcode: str
+    question: str
+    answer: str
+    timestamp: Optional[str] = None
+
+
+class TaskDecisionResponse(BaseModel):
+    """Decision ledger write result."""
+
+    task_id: str
+    saved: bool = True
+    progress: Optional[Dict[str, Any]] = None
+    next_task_id: Optional[str] = None
+    termination_condition: Optional[Dict[str, Any]] = None
+
+
+# =============================================================================
+# CORPUS BENCHMARKING (Feature 5)
+# =============================================================================
+
+class CorpusBenchmarkResponse(BaseModel):
+    """Response for GET /v2/corpus/benchmarks — domain averages for comparison."""
+
+    domain: str = "software"
+    total_compilations: int = 0
+    avg_component_count: float = 0.0
+    avg_trust_score: float = 0.0
+    avg_gap_count: float = 0.0

@@ -1057,6 +1057,9 @@ class TestCompileResult:
         assert result.cache_stats == {}
         assert result.dimensional_metadata == {}
         assert result.interface_map == {}
+        assert result.semantic_nodes == []
+        assert result.blocking_escalations == []
+        assert result.termination_condition == {}
 
     def test_success_result(self):
         """Success result has all expected fields."""
@@ -1067,6 +1070,217 @@ class TestCompileResult:
         )
         assert result.success
         assert len(result.insights) == 1
+
+
+class TestSemanticPausePayload:
+    def test_build_semantic_pause_payload_includes_conflict_options(self):
+        engine = MotherlabsEngine(llm_client=MockClient())
+
+        semantic_nodes, blocking_escalations = engine._build_semantic_pause_payload(
+            blueprint={
+                "components": [
+                    {
+                        "name": "AuthService",
+                        "type": "entity",
+                        "description": "Handles auth",
+                        "derived_from": "Build auth",
+                        "attributes": {},
+                        "methods": [],
+                        "validation_rules": [],
+                    }
+                ],
+                "relationships": [],
+                "constraints": [],
+                "unresolved": [],
+            },
+            verification={},
+            context_graph={
+                "keywords": ["auth"],
+                "conflict_summary": {
+                    "unresolved": [
+                        {
+                            "topic": "AuthService: storage strategy",
+                            "category": "MISSING_INFO",
+                            "positions": {
+                                "Entity": "Persist sessions in PostgreSQL",
+                                "Process": "Keep sessions stateless with JWT",
+                            },
+                        }
+                    ]
+                },
+            },
+            dimensional_metadata={},
+            description="Build auth",
+            run_id="engine-test",
+        )
+
+        assert semantic_nodes
+        assert semantic_nodes[0]["primitive"] == "purpose"
+        assert blocking_escalations[0]["postcode"] == "STR.ENT.APP.WHAT.SFT"
+        assert "storage strategy" in blocking_escalations[0]["question"].lower()
+        assert blocking_escalations[0]["options"] == [
+            "Persist sessions in PostgreSQL",
+            "Keep sessions stateless with JWT",
+        ]
+
+    def test_build_semantic_pause_payload_writes_blueprint_semantic_gates(self):
+        engine = MotherlabsEngine(llm_client=MockClient())
+        blueprint = {
+            "components": [
+                {
+                    "name": "AuthService",
+                    "type": "entity",
+                    "description": "Handles auth",
+                    "derived_from": "Build auth",
+                    "attributes": {},
+                    "methods": [],
+                    "validation_rules": [],
+                }
+            ],
+            "relationships": [],
+            "constraints": [],
+            "unresolved": ["AuthService needs provider fallback"],
+        }
+
+        engine._build_semantic_pause_payload(
+            blueprint=blueprint,
+            verification={},
+            context_graph={"keywords": ["auth"]},
+            dimensional_metadata={},
+            description="Build auth",
+            run_id="engine-test",
+        )
+
+        assert blueprint["semantic_gates"][0]["node_ref"] == "STR.ENT.APP.WHAT.SFT/authservice"
+        assert blueprint["semantic_gates"][0]["kind"] == "gap"
+
+    def test_build_semantic_pause_payload_preserves_model_emitted_gate_ownership(self):
+        engine = MotherlabsEngine(llm_client=MockClient())
+        blueprint = {
+            "components": [
+                {
+                    "name": "AuthService",
+                    "type": "entity",
+                    "description": "Handles auth",
+                    "derived_from": "Build auth",
+                    "attributes": {},
+                    "methods": [],
+                    "validation_rules": [],
+                }
+            ],
+            "relationships": [],
+            "constraints": [],
+            "unresolved": [],
+            "semantic_gates": [
+                {
+                    "owner_component": "AuthService",
+                    "question": "Clarify provider fallback strategy",
+                    "kind": "gap",
+                    "options": ["Anthropic", "OpenAI"],
+                    "stage": "verification",
+                }
+            ],
+        }
+
+        _, blocking_escalations = engine._build_semantic_pause_payload(
+            blueprint=blueprint,
+            verification={},
+            context_graph={"keywords": ["auth"]},
+            dimensional_metadata={},
+            description="Build auth",
+            run_id="engine-test",
+        )
+
+        assert blueprint["semantic_gates"][0]["node_ref"] == "STR.ENT.APP.WHAT.SFT/authservice"
+        assert blocking_escalations[0]["question"] == "Clarify provider fallback strategy"
+        assert blocking_escalations[0]["options"] == ["Anthropic", "OpenAI"]
+
+    def test_build_semantic_pause_payload_uses_verification_semantic_gates(self):
+        engine = MotherlabsEngine(llm_client=MockClient())
+        blueprint = {
+            "components": [
+                {
+                    "name": "AuthService",
+                    "type": "entity",
+                    "description": "Handles auth",
+                    "derived_from": "Build auth",
+                    "attributes": {},
+                    "methods": [],
+                    "validation_rules": [],
+                }
+            ],
+            "relationships": [],
+            "constraints": [],
+            "unresolved": [],
+        }
+
+        _, blocking_escalations = engine._build_semantic_pause_payload(
+            blueprint=blueprint,
+            verification={
+                "status": "needs_work",
+                "semantic_gates": [
+                    {
+                        "owner_component": "AuthService",
+                        "question": "Which provider fallback should AuthService use?",
+                        "kind": "semantic_conflict",
+                        "options": ["Anthropic", "OpenAI"],
+                        "stage": "verification",
+                    }
+                ],
+            },
+            context_graph={"keywords": ["auth"]},
+            dimensional_metadata={},
+            description="Build auth",
+            run_id="engine-test",
+        )
+
+        assert blueprint["semantic_gates"][0]["node_ref"] == "STR.ENT.APP.WHAT.SFT/authservice"
+        assert blocking_escalations[0]["kind"] == "semantic_conflict"
+        assert blocking_escalations[0]["question"] == "Which provider fallback should AuthService use?"
+
+    def test_build_semantic_pause_payload_prefers_native_semantic_nodes(self):
+        engine = MotherlabsEngine(llm_client=MockClient())
+        blueprint = {
+            "components": [
+                {
+                    "name": "AuthService",
+                    "type": "entity",
+                    "description": "Handles auth",
+                    "derived_from": "Build auth",
+                    "attributes": {},
+                    "methods": [],
+                    "validation_rules": [],
+                }
+            ],
+            "relationships": [],
+            "constraints": [],
+            "unresolved": [],
+            "semantic_nodes": [
+                {
+                    "postcode": "EXC.FNC.APP.HOW.SFT",
+                    "primitive": "authenticate",
+                    "description": "Validate credentials and create a session.",
+                    "fill_state": "F",
+                    "confidence": 0.94,
+                    "connections": ["STR.ENT.APP.WHAT.SFT/authservice"],
+                    "source_ref": ["Build auth"],
+                }
+            ],
+        }
+
+        semantic_nodes, _ = engine._build_semantic_pause_payload(
+            blueprint=blueprint,
+            verification={},
+            context_graph={"keywords": ["auth"]},
+            dimensional_metadata={},
+            description="Build auth",
+            run_id="engine-test",
+        )
+
+        refs = {f"{node['postcode']}/{node['primitive'].lower()}": node for node in semantic_nodes}
+        assert "EXC.FNC.APP.HOW.SFT/authenticate" in refs
+        assert "semantic_nodes" in blueprint
+        assert blueprint["semantic_nodes"][0]["created_at"]
 
 
 # =============================================================================
@@ -1671,6 +1885,58 @@ class TestTargetedResynthesis:
         result = eng.compile("Build auth system")
         assert result.verification.get("status") == "pass"
 
+    @patch("kernel.closed_loop.closed_loop_gate", side_effect=_passing_closed_loop_gate)
+    def test_resynthesis_stalls_when_no_semantic_progress(self, _mock_clg, tmp_path):
+        verify_needs_work = {
+            "status": "needs_work",
+            "completeness": {"score": 52, "gaps": []},
+            "consistency": {"score": 80, "conflicts": []},
+            "coherence": {"score": 70, "issues": [], "suggested_fixes": []},
+            "traceability": {"score": 80},
+        }
+
+        client = Mock(spec=BaseLLMClient)
+        client.deterministic = True
+        client.model = "mock-model"
+
+        synthesis_json = json.dumps(MOCK_SYNTHESIS_JSON)
+        additions_str = json.dumps({
+            "components": [],
+            "relationships": [],
+            "constraints": [],
+            "unresolved": [],
+        })
+        verify_needs_json = json.dumps(verify_needs_work)
+
+        def mock_complete(system_prompt, user_content, **kwargs):
+            sys_lower = (system_prompt or "").lower()
+            if "you are the persona agent" in sys_lower:
+                return json.dumps(MOCK_PERSONA_JSON)
+            if "you are the intent" in sys_lower:
+                return json.dumps(MOCK_INTENT_JSON)
+            if "you are the synthesis agent" in sys_lower:
+                return synthesis_json
+            if "verification gaps" in sys_lower or "re-synth" in sys_lower:
+                return additions_str
+            if "you are the verify" in sys_lower or "verification" in sys_lower:
+                return verify_needs_json
+            return "Turn analysis.\nINSIGHT: stable shape"
+
+        client.complete_with_system = Mock(side_effect=mock_complete)
+
+        corpus = Corpus(corpus_path=tmp_path / "corpus")
+        eng = MotherlabsEngine(
+            llm_client=client, corpus=corpus, auto_store=False, cache_policy="none"
+        )
+        eng._verify_hybrid = eng._verify_llm
+
+        result = eng.compile("Build auth system")
+
+        assert result.success is True
+        assert result.termination_condition["reason"] == "semantic_progress_stalled"
+        assert result.termination_condition["status"] == "stalled"
+        assert result.termination_condition["semantic_progress"]["fingerprint_changed"] is False
+
     def test_resynthesis_not_triggered_on_pass(self, engine):
         """Re-synthesis should NOT trigger when verification says pass."""
         result = engine.compile("Build auth system")
@@ -1718,8 +1984,12 @@ class TestTargetedResynthesis:
         assert result.verification.get("status") == "needs_work"
 
     def test_targeted_resynthesis_no_gaps(self, engine):
-        """When verification has no actionable gaps, return original blueprint."""
-        bp = {"components": [{"name": "A", "type": "entity", "description": "A", "derived_from": "input"}],
+        """When verification has no actionable gaps and component is not thin, return original blueprint."""
+        bp = {"components": [{"name": "A", "type": "entity", "description": "A", "derived_from": "input",
+                               "methods": [
+                                   {"name": "validate", "parameters": [], "return_type": "bool"},
+                                   {"name": "process", "parameters": [], "return_type": "None"},
+                               ]}],
               "relationships": [], "constraints": [], "unresolved": []}
         verification = {"status": "needs_work", "completeness": {"score": 50}}
         state = SharedState()
@@ -1737,6 +2007,129 @@ class TestTargetedResynthesis:
         state = SharedState()
         result = engine._targeted_resynthesis(bp, verification, state)
         assert "components" in result
+
+
+# =============================================================================
+# PHASE 28.1: THIN COMPONENT DETECTION & ENRICHMENT TESTS
+# =============================================================================
+
+
+class TestThinComponentDetection:
+    """Tests for _identify_thin_components — Phase 28.1."""
+
+    def test_entity_with_no_methods_is_thin(self):
+        """Entity with zero methods is detected as thin."""
+        bp = {"components": [
+            {"name": "User", "type": "entity", "description": "A user account",
+             "derived_from": "input", "methods": []}
+        ], "constraints": []}
+        verification = {}
+        result = MotherlabsEngine._identify_thin_components(bp, verification)
+        assert len(result) == 1
+        assert result[0]["name"] == "User"
+        assert any("method" in r for r in result[0]["reasons"])
+
+    def test_entity_with_lifecycle_but_no_state_machine_is_thin(self):
+        """Entity with lifecycle hint but no state machine is thin."""
+        bp = {"components": [
+            {"name": "Booking", "type": "entity",
+             "description": "A booking for a tattoo session with lifecycle management",
+             "derived_from": "input",
+             "methods": [{"name": "create", "parameters": [], "return_type": "None"},
+                         {"name": "cancel", "parameters": [], "return_type": "None"}]}
+        ], "constraints": []}
+        verification = {}
+        result = MotherlabsEngine._identify_thin_components(bp, verification)
+        assert len(result) == 1
+        assert any("state machine" in r for r in result[0]["reasons"])
+
+    def test_well_specified_entity_is_not_thin(self):
+        """Entity with methods and state machine is not detected as thin."""
+        bp = {"components": [
+            {"name": "Order", "type": "entity",
+             "description": "A customer order",
+             "derived_from": "input",
+             "methods": [
+                 {"name": "create", "parameters": [], "return_type": "None"},
+                 {"name": "cancel", "parameters": [], "return_type": "None"},
+                 {"name": "complete", "parameters": [], "return_type": "None"},
+             ],
+             "state_machine": {
+                 "states": ["PENDING", "CONFIRMED", "COMPLETED", "CANCELLED"],
+                 "initial_state": "PENDING",
+                 "transitions": [],
+             }}
+        ], "constraints": []}
+        verification = {}
+        result = MotherlabsEngine._identify_thin_components(bp, verification)
+        assert len(result) == 0
+
+    def test_interface_without_state_machine_not_flagged(self):
+        """Interface components shouldn't be flagged for missing state machine."""
+        bp = {"components": [
+            {"name": "API", "type": "interface",
+             "description": "REST API with booking lifecycle endpoints",
+             "derived_from": "input",
+             "methods": [
+                 {"name": "get_bookings", "parameters": [], "return_type": "list"},
+                 {"name": "create_booking", "parameters": [], "return_type": "dict"},
+             ]}
+        ], "constraints": []}
+        verification = {}
+        result = MotherlabsEngine._identify_thin_components(bp, verification)
+        assert len(result) == 0
+
+
+class TestApplyEnrichments:
+    """Tests for _apply_enrichments — Phase 28.1."""
+
+    def test_methods_merged_not_replaced(self):
+        """Enrichment should ADD methods, not replace existing ones."""
+        bp = {"components": [
+            {"name": "User", "type": "entity", "description": "A user",
+             "derived_from": "input",
+             "methods": [{"name": "validate", "parameters": [], "return_type": "bool"}]}
+        ]}
+        enriched = [
+            {"name": "User", "type": "entity", "description": "A user",
+             "methods": [
+                 {"name": "create", "parameters": [], "return_type": "None"},
+                 {"name": "delete", "parameters": [], "return_type": "None"},
+             ]}
+        ]
+        result = MotherlabsEngine._apply_enrichments(bp, enriched)
+        user_methods = [m["name"] for m in result["components"][0]["methods"]]
+        assert "validate" in user_methods  # Original preserved
+        assert "create" in user_methods   # New added
+        assert "delete" in user_methods   # New added
+
+    def test_state_machine_adopted(self):
+        """Enrichment should add state machine if component didn't have one."""
+        bp = {"components": [
+            {"name": "Order", "type": "entity", "description": "An order",
+             "derived_from": "input", "methods": []}
+        ]}
+        enriched = [
+            {"name": "Order", "type": "entity",
+             "state_machine": {"states": ["PENDING", "DONE"], "initial_state": "PENDING"}}
+        ]
+        result = MotherlabsEngine._apply_enrichments(bp, enriched)
+        assert result["components"][0].get("state_machine") is not None
+        assert "PENDING" in result["components"][0]["state_machine"]["states"]
+
+    def test_existing_state_machine_not_overwritten(self):
+        """Enrichment should NOT overwrite existing state machine."""
+        bp = {"components": [
+            {"name": "Order", "type": "entity", "description": "An order",
+             "derived_from": "input", "methods": [],
+             "state_machine": {"states": ["A", "B"], "initial_state": "A"}}
+        ]}
+        enriched = [
+            {"name": "Order", "type": "entity",
+             "state_machine": {"states": ["X", "Y"], "initial_state": "X"}}
+        ]
+        result = MotherlabsEngine._apply_enrichments(bp, enriched)
+        assert result["components"][0]["state_machine"]["states"] == ["A", "B"]
 
 
 # =============================================================================

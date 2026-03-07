@@ -16,6 +16,7 @@ Phase 5.1: Added structured logging, timeout handling, exponential backoff
 
 import copy
 import json
+import os
 import time
 import logging
 import signal
@@ -69,6 +70,11 @@ from core.telemetry import (
     compute_health,
     aggregate_to_dict,
     health_to_dict,
+)
+from core.emission_types import (
+    DifficultySignal,
+    InsightCategory,
+    StructuredInsight,
 )
 
 # Configure module logger
@@ -185,7 +191,7 @@ def exponential_backoff(attempt: int, base_delay: float = 1.0, max_delay: float 
 
 from core.protocol import SharedState, Message, MessageType, DialogueProtocol, TerminationState, calculate_dialogue_depth
 from core.llm import ClaudeClient, OpenAIClient, GeminiClient, GrokClient, create_client, BaseLLMClient, FailoverClient
-from core.schema import validate_blueprint, BlueprintSchema, check_canonical_coverage, check_canonical_relationships, validate_graph, add_version, deduplicate_blueprint, normalize_component_name, COMPONENT_ALIASES
+from core.schema import validate_blueprint, BlueprintSchema, check_canonical_coverage, check_canonical_relationships, validate_graph, add_version, deduplicate_blueprint, normalize_blueprint_elements, normalize_component_name, COMPONENT_ALIASES
 from core.provider_config import get_config as get_provider_config
 from persistence.corpus import Corpus, CompilationRecord
 from agents.spec_agents import create_entity_agent, create_process_agent, add_challenge_protocol
@@ -392,8 +398,8 @@ def _build_stage_gates() -> dict:
             max_retries=_engine_stages["verification"].max_retries,
             timeout_seconds=_engine_stages["verification"].timeout_seconds,
             required_criteria={
-                "completeness": 50,  # Relaxed: was 70
-                "traceability": 50,  # Relaxed: was 80
+                "completeness": 65,  # Tightened: was 50 (relaxed from 70)
+                "traceability": 60,  # Tightened: was 50 (relaxed from 80)
             },
             optional_criteria={
                 "consistency": 70,
@@ -439,6 +445,11 @@ class CompileResult:
     depth_chains: List[Dict[str, Any]] = field(default_factory=list)  # Unexplored endpoints for intent chaining
     context_map: Optional[Dict[str, Any]] = None  # CONTEXT mode: structured context understanding
     exploration_map: Optional[Dict[str, Any]] = None  # EXPLORE mode: divergent exploration insights
+    structured_insights: List[Dict[str, Any]] = field(default_factory=list)  # Glass box: rich typed insights
+    difficulty: Dict[str, Any] = field(default_factory=dict)  # Glass box: DifficultySignal snapshot
+    semantic_nodes: List[Dict[str, Any]] = field(default_factory=list)  # Postcode-native node payloads
+    blocking_escalations: List[Dict[str, Any]] = field(default_factory=list)  # Human decisions required to continue
+    termination_condition: Dict[str, Any] = field(default_factory=dict)  # Why compilation stopped here
 
 
 class MotherlabsEngine:
@@ -531,8 +542,27 @@ class MotherlabsEngine:
         # Must be set before agent initialization so factories can read adapter prompts
         self.domain_adapter = domain_adapter
 
-        # Quality LLM for synthesis/verification (falls back to default)
-        self.quality_llm = quality_llm or self.llm
+        # Quality LLM for synthesis/verification/governor (falls back to default).
+        # Auto-create Opus-tier client for Anthropic when no explicit quality_llm given.
+        # Set MOTHERLABS_SINGLE_TIER=1 to disable (all stages use same model).
+        tiered_disabled = os.environ.get("MOTHERLABS_SINGLE_TIER", "").strip() in ("1", "true")
+        claude_base = (
+            self.llm if isinstance(self.llm, ClaudeClient)
+            else (self.llm.providers[0] if isinstance(self.llm, FailoverClient) and self.llm.providers and isinstance(self.llm.providers[0], ClaudeClient) else None)
+        )
+        if quality_llm:
+            self.quality_llm = quality_llm
+        elif claude_base and not tiered_disabled and not claude_base.critical_model:
+            # Tiered routing: Opus for critical stages, Sonnet for the rest
+            critical_model = os.environ.get("MOTHERLABS_CRITICAL_MODEL", "claude-opus-4-20250514")
+            self.quality_llm = ClaudeClient(
+                api_key=claude_base.api_key,
+                model=critical_model,
+                deterministic=claude_base.deterministic,
+            )
+            logger.info(f"Tiered model routing: {critical_model} for synthesis/verify/governor, {claude_base.model} for dialogue")
+        else:
+            self.quality_llm = self.llm
 
         # Initialize agents (thread adapter for domain-specific prompts)
         self.intent_agent = create_intent_agent(self.llm, domain_adapter=self.domain_adapter)
@@ -541,7 +571,7 @@ class MotherlabsEngine:
         self.process_agent = add_challenge_protocol(create_process_agent(self.llm, domain_adapter=self.domain_adapter))
         self.synthesis_agent = create_synthesis_agent(self.quality_llm, domain_adapter=self.domain_adapter)
         self.verify_agent = create_verify_agent(self.quality_llm, domain_adapter=self.domain_adapter)
-        self.governor = create_governor(self.llm)
+        self.governor = create_governor(self.quality_llm)
 
         # Register all with governor
         for agent in [
@@ -567,6 +597,12 @@ class MotherlabsEngine:
         self._compilation_tokens: List[TokenUsage] = []
         self._session_cost_usd: float = 0.0
 
+        # Glass box: difficulty + structured insights (reset per compile)
+        self._difficulty = DifficultySignal()
+        self._structured_insights: List[StructuredInsight] = []
+        self._current_stage = "queued"
+        self._progress_callback: Optional[Callable] = None
+
         # Phase 26: Self-compile pattern feedback
         self._last_self_compile_patterns: list = []
 
@@ -581,8 +617,6 @@ class MotherlabsEngine:
             # Bootstrap in-memory outcomes from persistent store
             stored = self._outcome_store.recent(limit=50)
             if stored:
-                from mother.governor_feedback import CompilationOutcome
-
                 def _parse_compression_cats(raw: str) -> tuple:
                     if not raw:
                         return ()
@@ -592,20 +626,20 @@ class MotherlabsEngine:
                         return ()
 
                 self._compilation_outcomes = [
-                    CompilationOutcome(
-                        compile_id=r.compile_id,
-                        input_summary=r.input_summary,
-                        trust_score=r.trust_score,
-                        completeness=r.completeness,
-                        consistency=r.consistency,
-                        coherence=r.coherence,
-                        traceability=r.traceability,
-                        component_count=r.component_count,
-                        rejected=r.rejected,
-                        rejection_reason=r.rejection_reason,
-                        domain=r.domain,
-                        compression_loss_categories=_parse_compression_cats(getattr(r, "compression_loss_categories", "")),
-                    )
+                    {
+                        "compile_id": r.compile_id,
+                        "input_summary": r.input_summary,
+                        "trust_score": r.trust_score,
+                        "completeness": r.completeness,
+                        "consistency": r.consistency,
+                        "coherence": r.coherence,
+                        "traceability": r.traceability,
+                        "component_count": r.component_count,
+                        "rejected": r.rejected,
+                        "rejection_reason": r.rejection_reason,
+                        "domain": r.domain,
+                        "compression_loss_categories": _parse_compression_cats(getattr(r, "compression_loss_categories", "")),
+                    }
                     for r in reversed(stored)  # oldest first
                 ]
         except Exception as e:
@@ -724,6 +758,8 @@ class MotherlabsEngine:
         use_corpus_suggestions: bool = True,
         min_quality_score: Optional[float] = None,
         pipeline_mode: Optional[str] = None,
+        progress_callback: Optional[Callable] = None,
+        enrich: bool = False,
     ) -> CompileResult:
         """
         Compile natural language description into blueprint.
@@ -797,7 +833,15 @@ class MotherlabsEngine:
             )
 
         if quality_score.has_warnings:
-            self._emit_insight(f"Input quality: {quality_score.overall:.0%} — {quality_score.suggestion}")
+            self._emit_rich(
+                f"Input quality: {quality_score.overall:.0%} — {quality_score.suggestion}",
+                InsightCategory.METRIC,
+                metrics={"input_quality": quality_score.overall},
+            )
+
+        # Difficulty signal: input quality
+        self._difficulty.input_quality = quality_score.overall
+        self._emit_difficulty()
 
         # Store quality score for API response
         state.known["input_quality"] = {
@@ -811,10 +855,26 @@ class MotherlabsEngine:
 
         logger.info(f"Starting compilation: {description[:100]}...")
 
+        # Reset per-compilation glass-box state
+        self._difficulty = DifficultySignal()
+        self._structured_insights = []
+        self._current_stage = "queued"
+        self._progress_callback = progress_callback
+
         try:
+            # Progress callback helper
+            def _progress(stage: str, index: int, insight: str = "", **kwargs):
+                self._current_stage = stage
+                if progress_callback:
+                    try:
+                        progress_callback(stage, index, insight, **kwargs)
+                    except Exception as e:
+                        logger.debug("Progress callback failed: %s", e)
+
             # Phase 1: Extract intent (with cache check)
             logger.debug("Phase 1: Extracting intent")
             self._emit("Extracting intent...")
+            _progress("intent_analysis", 1)
             intent_start = time.time()
 
             # Phase 6.2: Check intent cache
@@ -859,12 +919,19 @@ class MotherlabsEngine:
                 self._timeout_scaled = True
 
             state.known["intent"] = intent
-            self._emit_insight(f"Core need: {intent.get('core_need', 'unknown')}")
+            self._emit_rich(
+                f"Core need: {intent.get('core_need', 'unknown')}",
+                InsightCategory.DISCOVERY,
+            )
 
             # Use explicit components from intent as canonical if not provided
             if not canonical_components and intent.get("explicit_components"):
                 canonical_components = intent["explicit_components"]
-                self._emit_insight(f"Canonical set from input: {len(canonical_components)} components")
+                self._emit_rich(
+                    f"Canonical set from input: {len(canonical_components)} components",
+                    InsightCategory.DISCOVERY,
+                    metrics={"count": float(len(canonical_components))},
+                )
 
             # Corpus-driven suggestions: look up patterns from prior compilations
             if use_corpus_suggestions and not canonical_components:
@@ -921,51 +988,28 @@ class MotherlabsEngine:
                 summary = rlog.get_summary()
                 if summary.total_rejections > 0 and summary.remediation_hints:
                     state.known["rejection_hints"] = list(summary.remediation_hints)
-                    self._emit_insight(f"Governor: {summary.total_rejections} prior rejections inform this compile")
+                    self._emit_rich(
+                        f"Governor: {summary.total_rejections} prior rejections inform this compile",
+                        InsightCategory.DECISION,
+                        reasoning="Prior failures inform compile strategy",
+                    )
             except Exception as e:
                 logger.debug(f"Rejection log read skipped: {e}")
 
             # Phase 22e: Governor feedback — compiler self-improvement directives
             try:
-                from mother.governor_feedback import (
-                    analyze_outcomes,
-                    generate_compiler_prompt_patch,
-                )
                 compilation_history = getattr(self, "_compilation_outcomes", [])
-                # Fall back to persistent outcome store when in-memory is empty
                 if not compilation_history and self._outcome_store:
-                    try:
-                        stored = self._outcome_store.recent(limit=20)
-                        if stored:
-                            from mother.governor_feedback import CompilationOutcome
-                            compilation_history = [
-                                CompilationOutcome(
-                                    compile_id=s.get("compile_id", ""),
-                                    input_summary=s.get("input_summary", ""),
-                                    trust_score=s.get("trust_score", 0),
-                                    completeness=s.get("completeness", 0),
-                                    consistency=s.get("consistency", 0),
-                                    coherence=s.get("coherence", 0),
-                                    traceability=s.get("traceability", 0),
-                                    component_count=s.get("component_count", 0),
-                                    rejected=s.get("rejected", False),
-                                    rejection_reason=s.get("rejection_reason", ""),
-                                    domain=s.get("domain", "software"),
-                                )
-                                for s in stored
-                                if isinstance(s, dict)
-                            ]
-                    except Exception as e:
-                        logger.debug(f"Persistent outcome load skipped: {e}")
-                if compilation_history:
-                    feedback_report = analyze_outcomes(compilation_history)
-                    prompt_patch = generate_compiler_prompt_patch(feedback_report)
-                    if prompt_patch:
-                        state.known["compiler_directives"] = prompt_patch
-                        self._emit_insight(
-                            f"Governor feedback: {feedback_report.outcomes_analyzed} prior "
-                            f"compilations analyzed, trend={feedback_report.trend}"
-                        )
+                    stored = self._outcome_store.recent(limit=20)
+                    if stored:
+                        compilation_history = [
+                            s if isinstance(s, dict) else {
+                                "compile_id": getattr(s, "compile_id", ""),
+                                "trust_score": getattr(s, "trust_score", 0),
+                                "domain": getattr(s, "domain", "software"),
+                            }
+                            for s in stored
+                        ]
             except Exception as e:
                 logger.debug(f"Governor feedback injection skipped: {e}")
 
@@ -975,7 +1019,11 @@ class MotherlabsEngine:
                 l2_patterns = load_patterns(min_confidence=0.5)
                 if l2_patterns:
                     state.known["l2_patterns"] = format_pattern_context(l2_patterns)
-                    self._emit_insight(f"L2: {len(l2_patterns)} learned pattern(s) loaded")
+                    self._emit_rich(
+                        f"L2: {len(l2_patterns)} learned pattern(s) loaded",
+                        InsightCategory.DECISION,
+                        reasoning="Corpus experience informs synthesis",
+                    )
             except Exception as e:
                 logger.debug(f"L2 pattern injection skipped: {e}")
 
@@ -1101,6 +1149,7 @@ class MotherlabsEngine:
             }
 
             # Phase 2: Generate personas (with cache check for "full" policy)
+            _progress("persona_mapping", 2, intent.get("core_need", ""))
             self._emit("Generating perspectives...")
             personas_start = time.time()
 
@@ -1132,7 +1181,10 @@ class MotherlabsEngine:
             self._check_cost_cap()
             state.personas = personas
             for p in personas[:2]:  # Show first 2
-                self._emit_insight(f"{p['name']}: {p['perspective'][:60]}...")
+                self._emit_rich(
+                    f"{p['name']}: {p['perspective'][:60]}...",
+                    InsightCategory.DISCOVERY,
+                )
 
             # Stage 2 verification (using formal gate)
             personas_metrics = {
@@ -1150,9 +1202,14 @@ class MotherlabsEngine:
             if _mode_cfg.posture_preamble:
                 self.entity_agent.system_prompt = _mode_cfg.posture_preamble + self.entity_agent.system_prompt
                 self.process_agent.system_prompt = _mode_cfg.posture_preamble + self.process_agent.system_prompt
-                self._emit_insight(f"Mode: {compilation_mode.value} (posture={_mode_cfg.agent_posture})")
+                self._emit_rich(
+                    f"Mode: {compilation_mode.value} (posture={_mode_cfg.agent_posture})",
+                    InsightCategory.DECISION,
+                    reasoning=f"Compilation mode {compilation_mode.value} adjusts agent challenge depth",
+                )
 
             # Phase 3: Spec dialogue
+            _progress("entity_extraction", 3)
             # Phase 14: Feature flag — "staged" uses StagedPipeline, "legacy" uses single dialogue
             mode = pipeline_mode or self.pipeline_mode
             dialogue_start = time.time()
@@ -1166,10 +1223,14 @@ class MotherlabsEngine:
                     intent=intent,
                     personas=personas
                 )
+                from core.convergence import compute_stage_budgets
+                stage_budgets = compute_stage_budgets(description)
+
                 staged = StagedPipeline(
                     llm_client=self.llm,
                     on_insight=self.on_insight,
                     domain_adapter=self.domain_adapter,
+                    stage_budgets=stage_budgets,
                 )
                 try:
                     with timeout_context(sum(s.timeout_seconds for s in PROTOCOL.pipeline.stages), "staged pipeline"):
@@ -1179,6 +1240,12 @@ class MotherlabsEngine:
                     state.insights = pipeline_state.all_insights
                     state.unknown = pipeline_state.all_unknowns
                     state.conflicts = pipeline_state.all_conflicts
+
+                    # Difficulty signal: unknowns + conflicts from entity extraction
+                    self._difficulty.unknown_count = len(state.unknown)
+                    self._difficulty.conflict_count = len(state.conflicts)
+                    self._emit_difficulty()
+
                     # Add last 2 messages from each stage to history for synthesis context
                     for record in pipeline_state.stages:
                         for msg in record.state.history[-2:]:
@@ -1219,7 +1286,11 @@ class MotherlabsEngine:
                     # Phase 10.8: Resolve structural conflicts by reframing
                     resolved = self._resolve_conflicts(state)
                     if resolved:
-                        self._emit_insight(f"Resolved {resolved} structural conflict(s) by reframing")
+                        self._emit_rich(
+                            f"Resolved {resolved} structural conflict(s) by reframing",
+                            InsightCategory.RESOLUTION,
+                            metrics={"resolved": float(resolved)},
+                        )
 
                     # Phase 10.9: Cross-agent factual consistency check
                     try:
@@ -1260,6 +1331,11 @@ class MotherlabsEngine:
                 self._collect_usage()
                 self._check_cost_cap()
 
+                # Difficulty signal: unknowns + conflicts from legacy dialogue
+                self._difficulty.unknown_count = len(state.unknown)
+                self._difficulty.conflict_count = len(state.conflicts)
+                self._emit_difficulty()
+
                 # Stage 3 verification (using formal gate)
                 dialogue_turns = len([m for m in state.history if m.sender in ["Entity", "Process"]])
                 dialogue_metrics = {
@@ -1273,7 +1349,11 @@ class MotherlabsEngine:
                 # Phase 10.8: Resolve structural conflicts by reframing
                 resolved = self._resolve_conflicts(state)
                 if resolved:
-                    self._emit_insight(f"Resolved {resolved} structural conflict(s) by reframing")
+                    self._emit_rich(
+                        f"Resolved {resolved} structural conflict(s) by reframing",
+                        InsightCategory.RESOLUTION,
+                        metrics={"resolved": float(resolved)},
+                    )
 
                 # Phase 10.9: Cross-agent factual consistency check
                 try:
@@ -1505,7 +1585,11 @@ class MotherlabsEngine:
                     intent_cache_hit, persona_cache_hit,
                 )
 
+            # Phase 3.7: Process modeling stage marker
+            _progress("process_modeling", 4)
+
             # Phase 4: Synthesis (with canonical enforcement if provided)
+            _progress("synthesis", 5)
             # Phase 7.2: Per-stage timeout
             self._emit("Synthesizing blueprint...")
             synthesis_start = time.time()
@@ -1523,6 +1607,9 @@ class MotherlabsEngine:
             self._check_cost_cap()
             retry_counts["synthesis"] = synthesis_retries
 
+            # Phase 8.1: Normalize string elements to dicts before any .get() calls
+            blueprint = normalize_blueprint_elements(blueprint)
+
             # Phase 8.2: Deduplicate blueprint
             blueprint, dedup_report = deduplicate_blueprint(blueprint)
             if dedup_report["total_removed"] > 0:
@@ -1539,6 +1626,25 @@ class MotherlabsEngine:
             # Phase 12.5: Enrich blueprint with extracted methods from dialogue
             blueprint = self._enrich_blueprint_methods(blueprint, state)
 
+            # SEED Protocol enforcement — L1/L2/L3 validation
+            from core.seed import validate_seed, seed_gate_rate
+            seed_result = validate_seed(blueprint, description)
+            seed_rate = seed_gate_rate(seed_result)
+            state.known["_seed_validation"] = {
+                "gate_rate": seed_rate,
+                "violations": {k: v for k, v in seed_result.items() if v},
+            }
+            if seed_rate < 1.0:
+                violation_count = sum(len(v) for v in seed_result.values())
+                self._emit_rich(
+                    f"SEED gate: {seed_rate:.0%} ({violation_count} violation(s))",
+                    InsightCategory.WARNING,
+                    metrics={"seed_gate_rate": seed_rate},
+                )
+                for law, violations in seed_result.items():
+                    for v in violations[:3]:
+                        logger.warning(f"SEED {v}")
+
             # Phase 17.2: Blueprint health check
             from core.blueprint_health import check_blueprint_health
             health_report = check_blueprint_health(blueprint)
@@ -1550,10 +1656,10 @@ class MotherlabsEngine:
                         error_code="E7002",
                     )
                 for err in health_report.errors:
-                    self._emit_insight(f"⚠ Health: {err}")
+                    self._emit_rich(f"⚠ Health: {err}", InsightCategory.WARNING)
             if health_report.warnings:
                 for warn in health_report.warnings:
-                    self._emit_insight(f"⚠ Health: {warn}")
+                    self._emit_rich(f"⚠ Health: {warn}", InsightCategory.WARNING)
 
             # Phase 18: Store health report for deterministic verification
             state.known["_health_report"] = {
@@ -1565,6 +1671,25 @@ class MotherlabsEngine:
             }
 
             state.known["blueprint"] = blueprint
+
+            # Announce synthesized components for live frontend crystallization
+            _comp_names = [c.get("name", "?") for c in blueprint.get("components", [])]
+            if _comp_names:
+                self._emit_rich(
+                    f"Extracted: {', '.join(_comp_names)}",
+                    InsightCategory.DISCOVERY,
+                    metrics={"count": float(len(_comp_names))},
+                )
+
+            # Difficulty signal: component complexity
+            _comp_count = len(blueprint.get("components", []))
+            _rel_count = len(blueprint.get("relationships", []))
+            # Normalize: 20+ components or 30+ relationships → complexity ~1.0
+            self._difficulty.component_complexity = min(
+                (_comp_count / 20.0) * 0.6 + (_rel_count / 30.0) * 0.4,
+                1.0,
+            )
+            self._emit_difficulty()
 
             # Stage 4 verification (using formal gate)
             schema_validation = validate_blueprint(blueprint)
@@ -1601,6 +1726,12 @@ class MotherlabsEngine:
                     stage_timings=stage_timings,
                     error="Synthesis produced 0 components",
                     interrogation=state.known.get("interrogation", {}),
+                    termination_condition=self._make_termination_condition(
+                        status="halted",
+                        reason="synthesis_empty",
+                        message="Compilation halted because synthesis produced no buildable structure.",
+                        next_action="Narrow the intent or add concrete entities and constraints.",
+                    ),
                 )
 
             # Phase 17.4: Constraint contradiction detection
@@ -1609,7 +1740,10 @@ class MotherlabsEngine:
             if contradictions:
                 logger.warning(f"E7004: {len(contradictions)} contradictory constraint(s) detected")
                 for c in contradictions:
-                    self._emit_insight(f"⚠ Contradiction ({c.contradiction_type}): {c.description}")
+                    self._emit_rich(
+                        f"⚠ Contradiction ({c.contradiction_type}): {c.description}",
+                        InsightCategory.WARNING,
+                    )
                 state.known["contradictions"] = [
                     {
                         "field": c.field,
@@ -1622,7 +1756,17 @@ class MotherlabsEngine:
             # Phase 18: Store contradiction count for deterministic verification
             state.known["_contradiction_count"] = len(contradictions)
 
+            # C006: Unknowns floor — short inputs must surface unknowns
+            unresolved = blueprint.get("unresolved", [])
+            if len(unresolved) == 0 and len(description) < 200:
+                logger.warning("C006: Zero unknowns from short input — likely under-excavated")
+                self._emit_rich(
+                    "C006: No unknowns surfaced — input may be under-excavated",
+                    InsightCategory.WARNING,
+                )
+
             # Phase 5: Verification
+            _progress("verification", 6, f"{len(blueprint.get('components', []))} components synthesized")
             # Phase 7.2: Per-stage timeout
             self._emit("Verifying...")
             verify_start = time.time()
@@ -1668,6 +1812,12 @@ class MotherlabsEngine:
                     stage_timings=stage_timings,
                     error="Catastrophic verification failure — all dimensions below 30",
                     interrogation=state.known.get("interrogation", {}),
+                    termination_condition=self._make_termination_condition(
+                        status="halted",
+                        reason="catastrophic_verification_failure",
+                        message="Compilation halted because verification failed across every core dimension.",
+                        next_action="Reduce scope or provide materially clearer input before recompiling.",
+                    ),
                 )
 
             # Trust floor: trigger re-synthesis if overall score < fail_threshold
@@ -1694,9 +1844,11 @@ class MotherlabsEngine:
                         f"{l.category}({l.severity:.1f})"
                         for l in cl_result.compression_losses[:3]
                     )
-                    self._emit_insight(
+                    self._emit_rich(
                         f"Closed-loop gate: fidelity={cl_result.fidelity_score:.2f} — "
-                        f"compression losses: {loss_summary or 'semantic drift'}"
+                        f"compression losses: {loss_summary or 'semantic drift'}",
+                        InsightCategory.METRIC,
+                        metrics={"fidelity": cl_result.fidelity_score},
                     )
                     # Store losses for re-synthesis to target (rich context)
                     if cl_result.compression_losses:
@@ -1717,7 +1869,11 @@ class MotherlabsEngine:
                     # Closed-loop failure triggers re-synthesis with targeted losses
                     verification["status"] = "needs_work"
                 else:
-                    self._emit_insight(f"Closed-loop gate: fidelity={cl_result.fidelity_score:.2f} ✓")
+                    self._emit_rich(
+                        f"Closed-loop gate: fidelity={cl_result.fidelity_score:.2f} ✓",
+                        InsightCategory.METRIC,
+                        metrics={"fidelity": cl_result.fidelity_score},
+                    )
             except Exception as e:
                 logger.warning(f"Closed-loop gate failed: {e}")
                 state.known["closed_loop_skipped"] = True
@@ -1791,6 +1947,10 @@ class MotherlabsEngine:
                     or num_components <= 3  # Catastrophically thin — force re-synthesis
                 )
                 if should_resynth:
+                    _pre_resynth_fingerprint = compute_structural_fingerprint(blueprint)
+                    _pre_resynth_score = self._verification_score(verification)
+                    _pre_resynth_gates = self._semantic_gate_signature(blueprint, verification)
+                    _pre_resynth_components = len(blueprint.get("components", []))
                     self._emit("Re-synthesizing from verification gaps...")
                     resynth_start = time.time()
                     with timeout_context(synthesis_gate.timeout_seconds, "re-synthesis"):
@@ -1809,6 +1969,29 @@ class MotherlabsEngine:
                     # Gap-fill methods on re-synthesized components
                     blueprint = self._infer_component_methods(blueprint)
                     state.known["blueprint"] = blueprint
+
+                    _post_resynth_fingerprint = compute_structural_fingerprint(blueprint)
+                    _post_resynth_score = self._verification_score(verification)
+                    _post_resynth_gates = self._semantic_gate_signature(blueprint, verification)
+                    if (
+                        _post_resynth_fingerprint == _pre_resynth_fingerprint
+                        and _post_resynth_score <= (_pre_resynth_score + 0.5)
+                        and _post_resynth_gates == _pre_resynth_gates
+                    ):
+                        state.known["_termination_condition"] = self._make_termination_condition(
+                            status="stalled",
+                            reason="semantic_progress_stalled",
+                            message="Compilation stopped making semantic progress after re-synthesis.",
+                            next_action="Add a narrower constraint, revise scope, or answer a blocking decision.",
+                            semantic_progress={
+                                "fingerprint_changed": False,
+                                "verification_score_delta": round(_post_resynth_score - _pre_resynth_score, 2),
+                                "components_delta": len(blueprint.get("components", [])) - _pre_resynth_components,
+                                "gates_changed": False,
+                            },
+                        )
+                        state.known["_skip_enrichment"] = True
+                        self._emit_insight("Termination: semantic progress stalled")
 
                     # Re-check closed-loop fidelity only if fidelity was the trigger
                     if _fidelity_triggered:
@@ -1857,7 +2040,31 @@ class MotherlabsEngine:
                     stage_results=stage_results,
                     error=f"Fidelity gate: blueprint fidelity {cl_fid:.2f} below {PROTOCOL.engine.fidelity_threshold} after re-synthesis",
                     interrogation=state.known.get("interrogation", {}),
+                    termination_condition=self._make_termination_condition(
+                        status="halted",
+                        reason="fidelity_gate_failed",
+                        message="Compilation halted because re-synthesis still failed the fidelity gate.",
+                        next_action="Revise the seed intent or reduce semantic scope before trying again.",
+                    ),
                 )
+
+            # Phase 28.1: Enrichment pass — fill thin components with domain operations
+            # Runs even when verification passes, because "pass" doesn't mean "deep"
+            if verification.get("status") != "catastrophic":
+                thin_components = self._identify_thin_components(blueprint, verification)
+                if thin_components and not state.known.get("_enrichment_done") and not state.known.get("_skip_enrichment"):
+                    self._emit("Enriching thin components with domain operations...")
+                    enrich_start = time.time()
+                    try:
+                        with timeout_context(synthesis_gate.timeout_seconds, "enrichment"):
+                            blueprint = self._targeted_resynthesis(blueprint, verification, state)
+                        blueprint, _enrich_dedup = deduplicate_blueprint(blueprint)
+                        stage_timings["enrichment"] = time.time() - enrich_start
+                        self._collect_usage()
+                        self._check_cost_cap()
+                    except Exception as e:
+                        logger.warning(f"Enrichment pass skipped: {e}")
+                    state.known["_enrichment_done"] = True
 
             # Phase 14: Promote undeclared endpoints (re-run after any re-synthesis)
             blueprint = self._promote_undeclared_endpoints(blueprint)
@@ -1867,6 +2074,41 @@ class MotherlabsEngine:
             if graph_validation.get("errors"):
                 for err in graph_validation["errors"]:
                     self._emit_insight(f"⚠ Graph: {err}")
+
+            # Re-run SEED on final blueprint (after enrichment + second promote)
+            from core.seed import validate_seed, seed_gate_rate
+            seed_final = validate_seed(blueprint, description)
+            seed_final_rate = seed_gate_rate(seed_final)
+            state.known["_seed_validation_final"] = {
+                "gate_rate": seed_final_rate,
+                "violations": {k: v for k, v in seed_final.items() if v},
+            }
+
+            # Phase 15: Auto-resolution — resolve unknowns without asking user
+            from core.resolution import resolve_unresolved, apply_resolution_to_blueprint
+            resolution_report = resolve_unresolved(
+                blueprint=blueprint,
+                verification=verification,
+                context_graph=state.to_context_graph(),
+                original_input=description,
+            )
+            blueprint = apply_resolution_to_blueprint(blueprint, resolution_report)
+            if resolution_report.resolved_count:
+                self._emit_rich(
+                    f"Auto-resolved {resolution_report.resolved_count} unknowns, "
+                    f"{resolution_report.acknowledged_count} acknowledged",
+                    InsightCategory.RESOLUTION,
+                    metrics={
+                        "resolved": float(resolution_report.resolved_count),
+                        "acknowledged": float(resolution_report.acknowledged_count),
+                    },
+                )
+
+            # Difficulty signal: ambiguity count from resolution
+            self._difficulty.ambiguity_count = (
+                resolution_report.resolved_count + resolution_report.acknowledged_count
+            )
+            self._emit_difficulty()
 
             # Phase A: Extract dimensional metadata
             from core.dimension_extractor import build_dimensional_metadata
@@ -1946,6 +2188,8 @@ class MotherlabsEngine:
                 )
             context_graph_data["provenance_integrity"] = round(_prov_integrity, 3)
 
+            _progress("materialization", 7, "Building final output")
+
             # Success = blueprint has components. Verification is a quality signal,
             # not a hard gate. A blueprint with 20+ components and "needs_work"
             # verification is still a valid, usable compilation.
@@ -1955,6 +2199,55 @@ class MotherlabsEngine:
             corpus_feedback = self._compute_corpus_feedback(
                 blueprint, corpus_suggestions, state.known.get("domain_model"),
             )
+
+            semantic_nodes, blocking_escalations = self._build_semantic_pause_payload(
+                blueprint=blueprint,
+                verification=verification,
+                context_graph=context_graph_data,
+                dimensional_metadata=dimensional_dict,
+                description=description,
+                run_id=f"engine:{int(time.time())}",
+            )
+            if blocking_escalations:
+                _progress(
+                    "awaiting_decision",
+                    7,
+                    blocking_escalations[0].get("question", "Human decision required before coding can continue."),
+                    escalations=blocking_escalations,
+                )
+
+            termination_condition = state.known.get("_termination_condition")
+            if blocking_escalations:
+                termination_condition = self._make_termination_condition(
+                    status="awaiting_human",
+                    reason="human_decision_required",
+                    message=blocking_escalations[0].get(
+                        "question",
+                        "A human decision is required before compilation can continue.",
+                    ),
+                    next_action="Answer the blocking question to resume compilation.",
+                    semantic_progress=(
+                        termination_condition.get("semantic_progress")
+                        if isinstance(termination_condition, dict)
+                        else None
+                    ),
+                )
+            elif not termination_condition:
+                verification_status = verification.get("status")
+                termination_condition = self._make_termination_condition(
+                    status="complete",
+                    reason="verification_passed" if verification_status == "pass" else "quality_floor_reached",
+                    message=(
+                        "Compilation completed and the blueprint is ready to inspect."
+                        if verification_status == "pass"
+                        else "Compilation stopped at the current quality floor without a blocking human decision."
+                    ),
+                    next_action=(
+                        "Export the blueprint or compile deeper."
+                        if verification_status == "pass"
+                        else "Review governance, add constraints, or deepen the compile."
+                    ),
+                )
 
             result = CompileResult(
                 success=has_blueprint,
@@ -1976,6 +2269,11 @@ class MotherlabsEngine:
                 interrogation=state.known.get("interrogation", {}),
                 semantic_grid=kernel_grid_data,
                 depth_chains=_depth_chain_dicts,
+                structured_insights=[si.to_dict() for si in self._structured_insights],
+                difficulty=self._difficulty.to_dict(),
+                semantic_nodes=semantic_nodes,
+                blocking_escalations=blocking_escalations,
+                termination_condition=termination_condition,
             )
 
             # Phase 12.2a: Collect process telemetry
@@ -2037,7 +2335,7 @@ class MotherlabsEngine:
                     corpus_feedback=_corpus_feedback_json,
                     **telemetry,
                 )
-                self._emit_insight(f"Stored as {record.id}")
+                self._emit_rich(f"Stored as {record.id}", InsightCategory.STATUS)
 
             # Phase 19: Record metrics in ring buffer
             total_duration = sum(stage_timings.values())
@@ -2079,23 +2377,22 @@ class MotherlabsEngine:
 
             # Phase 22f: Record outcome for governor feedback loop
             try:
-                from mother.governor_feedback import CompilationOutcome
                 v = verification or {}
                 cat_dist = state.known.get("compression_loss_categories", {})
-                outcome = CompilationOutcome(
-                    compile_id=comp_id or f"compile-{int(time.time())}",
-                    input_summary=description[:200],
-                    trust_score=v_score,
-                    completeness=self._extract_dim_score(v, "completeness"),
-                    consistency=self._extract_dim_score(v, "consistency"),
-                    coherence=self._extract_dim_score(v, "coherence"),
-                    traceability=self._extract_dim_score(v, "traceability"),
-                    component_count=len(result.blueprint.get("components", [])),
-                    rejected=not result.success,
-                    rejection_reason=result.error or "",
-                    domain=state.known.get("domain", "software"),
-                    compression_loss_categories=tuple(sorted(cat_dist.items())),
-                )
+                outcome = {
+                    "compile_id": comp_id or f"compile-{int(time.time())}",
+                    "input_summary": description[:200],
+                    "trust_score": v_score,
+                    "completeness": self._extract_dim_score(v, "completeness"),
+                    "consistency": self._extract_dim_score(v, "consistency"),
+                    "coherence": self._extract_dim_score(v, "coherence"),
+                    "traceability": self._extract_dim_score(v, "traceability"),
+                    "component_count": len(result.blueprint.get("components", [])),
+                    "rejected": not result.success,
+                    "rejection_reason": result.error or "",
+                    "domain": state.known.get("domain", "software"),
+                    "compression_loss_categories": tuple(sorted(cat_dist.items())),
+                }
                 if not hasattr(self, "_compilation_outcomes"):
                     self._compilation_outcomes = []
                 self._compilation_outcomes.append(outcome)
@@ -2105,18 +2402,18 @@ class MotherlabsEngine:
                 # Persist to SQLite — survives restart
                 if self._outcome_store:
                     self._outcome_store.append(
-                        compile_id=outcome.compile_id,
-                        input_summary=outcome.input_summary,
-                        trust_score=outcome.trust_score,
-                        completeness=outcome.completeness,
-                        consistency=outcome.consistency,
-                        coherence=outcome.coherence,
-                        traceability=outcome.traceability,
-                        component_count=outcome.component_count,
-                        rejected=outcome.rejected,
-                        rejection_reason=outcome.rejection_reason,
-                        domain=outcome.domain,
-                        compression_loss_categories=json.dumps(dict(outcome.compression_loss_categories)) if outcome.compression_loss_categories else "",
+                        compile_id=outcome["compile_id"],
+                        input_summary=outcome["input_summary"],
+                        trust_score=outcome["trust_score"],
+                        completeness=outcome["completeness"],
+                        consistency=outcome["consistency"],
+                        coherence=outcome["coherence"],
+                        traceability=outcome["traceability"],
+                        component_count=outcome["component_count"],
+                        rejected=outcome["rejected"],
+                        rejection_reason=outcome["rejection_reason"],
+                        domain=outcome["domain"],
+                        compression_loss_categories=json.dumps(dict(outcome["compression_loss_categories"])) if outcome["compression_loss_categories"] else "",
                     )
             except Exception as e:
                 logger.debug(f"Outcome recording skipped: {e}")
@@ -2214,8 +2511,15 @@ class MotherlabsEngine:
                     "competing_configs": list(e.signal.competing_configs),
                     "collapsing_constraint": e.signal.collapsing_constraint,
                     "agent": e.signal.agent,
+                    "context": e.signal.context,
                 } if e.signal else None,
                 interrogation=state.known.get("interrogation", {}),
+                termination_condition=self._make_termination_condition(
+                    status="awaiting_human",
+                    reason="intent_fracture",
+                    message="Compilation hit an intent fracture with multiple valid semantic directions.",
+                    next_action="Choose the collapsing constraint so the compiler can continue.",
+                ),
             )
         except MotherlabsTimeoutError as e:
             logger.error(f"Timeout during compilation: {e.operation} after {e.timeout_seconds}s")
@@ -2228,6 +2532,12 @@ class MotherlabsEngine:
                 stage_results=stage_results,
                 error=str(e),
                 interrogation=state.known.get("interrogation", {}),
+                termination_condition=self._make_termination_condition(
+                    status="halted",
+                    reason="timeout",
+                    message=str(e),
+                    next_action="Retry with narrower scope or a higher budget/time ceiling.",
+                ),
             )
         except MotherlabsError as e:
             logger.error(f"Compilation error: {type(e).__name__}: {e}")
@@ -2240,6 +2550,12 @@ class MotherlabsEngine:
                 stage_results=stage_results,
                 error=str(e),
                 interrogation=state.known.get("interrogation", {}),
+                termination_condition=self._make_termination_condition(
+                    status="halted",
+                    reason=type(e).__name__,
+                    message=str(e),
+                    next_action="Revise the input or resolve the reported compiler error before retrying.",
+                ),
             )
         except Exception as e:
             logger.exception(f"Unexpected error during compilation: {e}")
@@ -2252,6 +2568,12 @@ class MotherlabsEngine:
                 stage_results=stage_results,
                 error=str(e),
                 interrogation=state.known.get("interrogation", {}),
+                termination_condition=self._make_termination_condition(
+                    status="halted",
+                    reason="unexpected_error",
+                    message=str(e),
+                    next_action="Inspect the compiler error and retry with a narrower scope.",
+                ),
             )
 
     # =========================================================================
@@ -2540,8 +2862,58 @@ class MotherlabsEngine:
         return float(val) if val else 0.0
 
     def _emit_insight(self, insight: str):
-        """Emit insight for CLI display."""
+        """Emit insight for CLI display and progress callback."""
         self.on_insight(f"  → {insight}")
+        # Also push flat insight to progress callback for live frontend display
+        if self._progress_callback:
+            try:
+                self._progress_callback(self._current_stage, -1, insight)
+            except Exception as e:
+                logger.debug(f"Progress callback failed: {e}")
+
+    def _emit_rich(
+        self,
+        text: str,
+        category: str,
+        metrics: Optional[Dict[str, float]] = None,
+        reasoning: str = "",
+    ) -> None:
+        """Emit a structured insight for glass-box compilation.
+
+        Creates a StructuredInsight, appends to internal list, calls
+        _emit_insight() for backward compat, and pushes the structured
+        dict to progress_callback if available.
+        """
+        si = StructuredInsight(
+            text=text,
+            category=category,
+            stage=self._current_stage,
+            metrics=metrics or {},
+            reasoning=reasoning,
+        )
+        self._structured_insights.append(si)
+        # Backward compat: flat insight still goes to CLI + progress
+        self._emit_insight(text)
+        # Push structured dict to progress callback if wired
+        if self._progress_callback:
+            try:
+                self._progress_callback(
+                    self._current_stage, -1, "",
+                    structured_insight=si.to_dict(),
+                )
+            except Exception as e:
+                logger.debug("Structured insight push failed: %s", e)
+
+    def _emit_difficulty(self) -> None:
+        """Push current difficulty snapshot to progress callback."""
+        if self._progress_callback:
+            try:
+                self._progress_callback(
+                    self._current_stage, -1, "",
+                    difficulty=self._difficulty.to_dict(),
+                )
+            except Exception as e:
+                logger.debug("Difficulty push failed: %s", e)
 
     def _check_gate(
         self,
@@ -2607,6 +2979,152 @@ class MotherlabsEngine:
             errors=errors,
             warnings=warnings
         )
+
+    def _build_semantic_pause_payload(
+        self,
+        *,
+        blueprint: Dict[str, Any],
+        verification: Dict[str, Any],
+        context_graph: Dict[str, Any],
+        dimensional_metadata: Dict[str, Any],
+        description: str,
+        run_id: str,
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Project compile output into postcode-native nodes + pause candidates."""
+        if not blueprint.get("components"):
+            return [], []
+
+        from core.blueprint_protocol import (
+            build_blueprint_semantic_gates,
+            build_blueprint_semantic_nodes,
+            build_semantic_gate_escalations,
+        )
+        from core.trust import compute_trust_indicators, serialize_trust_indicators
+
+        intent_keywords = context_graph.get("keywords", []) if isinstance(context_graph, dict) else []
+        trust_payload = serialize_trust_indicators(
+            compute_trust_indicators(
+                blueprint=blueprint,
+                verification=verification,
+                context_graph=context_graph,
+                dimensional_metadata=dimensional_metadata,
+                intent_keywords=intent_keywords,
+            )
+        )
+        blueprint["semantic_gates"] = build_blueprint_semantic_gates(
+            blueprint,
+            trust=trust_payload,
+            verification=verification,
+            context_graph=context_graph,
+        )
+
+        semantic_nodes = [
+            node.model_dump()
+            for node in build_blueprint_semantic_nodes(
+                blueprint,
+                seed_text=description,
+                trust=trust_payload,
+                verification=verification,
+                run_id=run_id,
+            )
+        ]
+        blocking_escalations = build_semantic_gate_escalations(
+            semantic_nodes,
+            blueprint=blueprint,
+            trust=trust_payload,
+            context_graph=context_graph,
+        )
+        blueprint["semantic_nodes"] = list(semantic_nodes)
+        return semantic_nodes, blocking_escalations
+
+    def _normalize_synthesis_output(
+        self,
+        blueprint: Dict[str, Any],
+        *,
+        run_id: str,
+    ) -> Dict[str, Any]:
+        """Stabilize synthesis sidecars so downstream code sees canonical shapes."""
+        normalized = dict(blueprint or {})
+        normalized.setdefault("components", [])
+        normalized.setdefault("relationships", [])
+        normalized.setdefault("constraints", [])
+        normalized.setdefault("unresolved", [])
+
+        if not isinstance(normalized.get("semantic_gates"), list):
+            normalized["semantic_gates"] = []
+        if not isinstance(normalized.get("semantic_nodes"), list):
+            normalized["semantic_nodes"] = []
+
+        if normalized["semantic_nodes"]:
+            from core.blueprint_protocol import build_blueprint_semantic_nodes
+
+            normalized["semantic_nodes"] = [
+                node.model_dump()
+                for node in build_blueprint_semantic_nodes(
+                    normalized,
+                    seed_text="",
+                    verification={},
+                    run_id=run_id,
+                    agent_id="Synthesis",
+                )
+            ]
+
+        return normalized
+
+    @staticmethod
+    def _verification_score(verification: Dict[str, Any]) -> float:
+        dims = []
+        for key in ("completeness", "consistency", "coherence", "traceability"):
+            value = verification.get(key, 0) if isinstance(verification, dict) else 0
+            if isinstance(value, dict):
+                dims.append(float(value.get("score", 0) or 0))
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                dims.append(float(value))
+            else:
+                dims.append(0.0)
+        return sum(dims) / max(len(dims), 1)
+
+    @staticmethod
+    def _semantic_gate_signature(blueprint: Dict[str, Any], verification: Dict[str, Any]) -> List[tuple[str, str, str]]:
+        signature: set[tuple[str, str, str]] = set()
+        for gate_source in (
+            (blueprint or {}).get("semantic_gates", []) or [],
+            (verification or {}).get("semantic_gates", []) or [],
+        ):
+            for gate in gate_source:
+                if not isinstance(gate, dict):
+                    continue
+                question = str(gate.get("question") or "").strip().lower()
+                if not question:
+                    continue
+                identity = str(
+                    gate.get("node_ref")
+                    or gate.get("owner_component")
+                    or gate.get("postcode")
+                    or question
+                ).strip().lower()
+                kind = str(gate.get("kind") or "semantic_gate").strip().lower()
+                signature.add((identity, question, kind))
+        return sorted(signature)
+
+    @staticmethod
+    def _make_termination_condition(
+        *,
+        status: str,
+        reason: str,
+        message: str,
+        next_action: str,
+        semantic_progress: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        payload = {
+            "status": status,
+            "reason": reason,
+            "message": message,
+            "next_action": next_action,
+        }
+        if semantic_progress:
+            payload["semantic_progress"] = semantic_progress
+        return payload
 
     def _extract_intent(self, description: str, state: SharedState) -> Dict[str, Any]:
         """
@@ -4414,28 +4932,44 @@ For each algorithm, include it as an entry in the "algorithms" array on the corr
 Methods from dialogue are EXPLICITLY stated — include verbatim.
 Methods from pattern_transfer are inferred — include as stubs.""")
         else:
-            # No extracted methods — instruct LLM to infer minimal interfaces
+            # No extracted methods — instruct LLM to infer from domain knowledge
             sections.append("""SECTION 3: METHOD INFERENCE
 
 No methods were explicitly extracted from dialogue. For each component, INFER methods from its
-type, description, and relationships. Focus on DOMAIN-SPECIFIC operations, not generic boilerplate:
+type, description, relationships, and DOMAIN KNOWLEDGE:
 
-- ENTITY components: include operations that reflect the entity's specific purpose and behavior
-  as described. Simple data containers (value objects, records) need FEW methods — prefer typed
-  fields over getter methods. Complex entities need domain operations.
-- PROCESS components: include the specific actions this process performs based on its description.
-  Do NOT add generic lifecycle methods (start, execute, get_status) unless the description
-  explicitly describes a long-running daemon or background service.
+- ENTITY components with lifecycle (Booking, Order, Task, Ticket, etc.):
+  MUST include: create, update, delete/cancel operations WITH preconditions
+  MUST include: state_machine if entity has stages/phases/status
+  SHOULD include: validation method, serialization method
+  Example: Booking → create(artist, client, time_slot), confirm(), cancel(reason),
+  reschedule(new_time), validate() with state_machine [PENDING→CONFIRMED→COMPLETED→CANCELLED]
+
+- ENTITY components that are data containers (Config, Settings, Profile):
+  Include: validate(), update(partial_data), to_dict()
+  Do NOT pad with getters — use typed attributes instead
+
+- PROCESS components (services, handlers, pipelines):
+  MUST include: the primary operation this process performs
+  MUST include: error handling behavior (what happens on failure?)
+  SHOULD include: precondition checks and side effects
+  Example: PaymentService → process_payment(amount, method), refund(payment_id, reason),
+  validate_payment_method(method) with constraints [amount > 0, method must be verified]
+
 - INTERFACE components: include the operations the interface exposes based on intent
 
 For each method provide:
   {"name": "...", "parameters": [{"name": "...", "type_hint": "..."}],
    "return_type": "...", "description": "...",
-   "derived_from": "Inferred from <quote component description or relationship>"}
+   "derived_from": "domain invariant: [entity type] requires [operation] because [reason]"}
 
-CRITICAL: Every method must trace to something in the input or component description.
-Do NOT invent methods with no anchor in the user's intent. Do NOT pad with generic
-getters/setters/status methods — fewer domain-specific methods are better than many generic ones.""")
+Think like a senior engineer reviewing this spec: what operations would you EXPECT to exist
+that the user didn't mention because they're obvious in this domain? Those are not inventions —
+they are structural necessities. A booking entity without cancel() is incomplete.
+A payment service without validation is broken.
+
+Do NOT pad with generic getters/setters/status methods. DO include domain-essential operations
+that any implementation would require.""")
 
         # SECTION 4: PATTERN TRANSFER DIRECTIVES (Phase 11.3, refined 12.4b)
         pattern_matches = _extract_pattern_matches(state.insights)
@@ -4509,7 +5043,13 @@ relationships. If a component has no relationship path to the rest of the system
 add a relationship (uses, contains, depends_on, etc.) that connects it.
 METHODS MANDATE: Every component MUST have a non-empty "methods" array. Infer methods
 from the component's type and description if not explicitly stated in dialogue.
-Output JSON: {components[], relationships[], constraints[], unresolved[]}
+If the blueprint still requires a human decision, emit semantic_gates[] entries using:
+  {"owner_component": "ComponentName", "question": "...", "kind": "gap|semantic_conflict",
+   "options": ["..."], "stage": "verification"}
+Only emit semantic_gates for real human-in-the-loop decisions, not generic TODOs.
+If you can confidently place a concept in postcode space, also emit semantic_nodes[] entries
+with: postcode, primitive, description, fill_state, confidence, connections[], source_ref[].
+Output JSON: {components[], relationships[], constraints[], unresolved[], semantic_gates[], semantic_nodes[]}
 Use EXACT names from input.""")
 
         # Phase 12.2c: Add conflict mediation guidance to synthesis prompt
@@ -4523,8 +5063,9 @@ Use EXACT names from input.""")
                 conflict_lines.append(f"- [{category}] {topic}: {pos}")
             conflict_section = "SECTION 8: UNRESOLVED CONFLICTS\n" + "\n".join(conflict_lines)
             conflict_section += (
-                "\n\nFor PRIORITY conflicts: choose the option that serves the core_need.\n"
-                "For MISSING_INFO conflicts: mark as unresolved in the blueprint.\n"
+                "\n\nFor PRIORITY conflicts: choose the option that serves the core_need unless a human decision is still required.\n"
+                "If a human decision is still required, add a semantic_gates[] entry with the owner component and both options.\n"
+                "For MISSING_INFO conflicts: mark as unresolved in the blueprint AND add a semantic_gates[] entry naming the owner component.\n"
                 "For TRADEOFF conflicts: choose the option with broader impact, note the alternative."
             )
             sections.append(conflict_section)
@@ -4568,7 +5109,13 @@ Use EXACT names from input.""")
         attempt_0_passed = False
         missing_methods = []
         try:
-            blueprint = self._extract_json(result_0.message.content)
+            blueprint = self._normalize_synthesis_output(
+                self._parse_structured_output(
+                    result_0.message.content,
+                    "synthesis",
+                ),
+                run_id="synthesis-attempt-0",
+            )
             if "components" in blueprint:
                 # Score attempt 0
                 comp_coverage = {"coverage": 1.0, "missing": []}
@@ -4731,7 +5278,13 @@ RETRY #{attempt}: Your previous output was incomplete.
         best_retry_cr = None
         for cr in call_results:
             try:
-                bp = self._extract_json(cr.message.content)
+                bp = self._normalize_synthesis_output(
+                    self._parse_structured_output(
+                        cr.message.content,
+                        "synthesis",
+                    ),
+                    run_id="synthesis-retry",
+                )
                 if "components" not in bp:
                     continue
 
@@ -4828,13 +5381,21 @@ RETRY #{attempt}: Your previous output was incomplete.
         state.add_message(response)
 
         try:
-            verification = self._extract_json(response.content)
+            verification = self._parse_structured_output(
+                response.content,
+                "verification",
+                state=state,
+                agent=self.verify_agent,
+                original_msg=msg,
+            )
             if "status" in verification:
-                return verification
+                return self._normalize_verification_output(verification)
         except Exception as e:
             logger.warning(f"Verification LLM parse failed: {e}")
 
-        return {"status": "needs_work", "error": "Verification parse failed"}
+        return self._normalize_verification_output(
+            {"status": "needs_work", "error": "Verification parse failed"}
+        )
 
     @staticmethod
     def _extract_intent_keywords(intent: Dict[str, Any], input_text: str) -> list:
@@ -4980,7 +5541,9 @@ RETRY #{attempt}: Your previous output was incomplete.
                 f"Evaluate ONLY these dimensions: {dim_list}. "
                 "For each, return a score (0-100) and brief details. "
                 "Return JSON with status ('pass' if all >= 70, else 'needs_work') "
-                "and a key for each dimension with {score, details, gaps/conflicts/issues}."
+                "and a key for each dimension with {score, details, gaps/conflicts/issues}. "
+                "If verification still needs a human decision, emit semantic_gates[] with "
+                "{owner_component, question, kind, options, stage:'verification'}."
             ),
         })
 
@@ -4994,13 +5557,92 @@ RETRY #{attempt}: Your previous output was incomplete.
         state.add_message(response)
 
         try:
-            verification = self._extract_json(response.content)
+            verification = self._parse_structured_output(
+                response.content,
+                "verification",
+                state=state,
+                agent=self.verify_agent,
+                original_msg=msg,
+            )
             if "status" in verification:
-                return verification
+                return self._normalize_verification_output(verification)
         except Exception as e:
             logger.warning(f"Focused verification parse failed: {e}")
 
-        return {"status": "needs_work", "error": "Focused verification parse failed"}
+        return self._normalize_verification_output(
+            {"status": "needs_work", "error": "Focused verification parse failed"}
+        )
+
+    @staticmethod
+    def _normalize_verification_output(verification: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize verifier output into a stable dict contract."""
+        if not isinstance(verification, dict):
+            return {"status": "needs_work", "semantic_gates": []}
+
+        normalized = dict(verification)
+        normalized.setdefault("status", "needs_work")
+
+        for dim in (
+            "completeness",
+            "consistency",
+            "coherence",
+            "traceability",
+            "actionability",
+            "specificity",
+            "codegen_readiness",
+            "subsystem_validation",
+        ):
+            value = normalized.get(dim)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                normalized[dim] = {"score": value}
+            elif value is not None and not isinstance(value, dict):
+                normalized[dim] = {"details": str(value)}
+
+        gates: List[Dict[str, Any]] = []
+        seen_gates: set[tuple[str, str, str]] = set()
+        for raw_gate in normalized.get("semantic_gates", []) or []:
+            if not isinstance(raw_gate, dict):
+                continue
+            question = str(raw_gate.get("question") or "").strip()
+            if not question:
+                continue
+            owner_component = str(
+                raw_gate.get("owner_component")
+                or raw_gate.get("owner")
+                or raw_gate.get("component")
+                or ""
+            ).strip()
+            node_ref = str(raw_gate.get("node_ref") or "").strip()
+            postcode = str(raw_gate.get("postcode") or "").strip()
+            gate_key = (
+                (owner_component or node_ref or postcode or question).lower(),
+                question.lower(),
+                str(raw_gate.get("kind") or "semantic_gate").lower(),
+            )
+            if gate_key in seen_gates:
+                continue
+            seen_gates.add(gate_key)
+
+            gate: Dict[str, Any] = {
+                "question": question,
+                "kind": str(raw_gate.get("kind") or "semantic_gate"),
+                "options": [
+                    str(option).strip()
+                    for option in raw_gate.get("options", []) or []
+                    if str(option).strip()
+                ],
+                "stage": str(raw_gate.get("stage") or "verification"),
+            }
+            if owner_component:
+                gate["owner_component"] = owner_component
+            if node_ref:
+                gate["node_ref"] = node_ref
+            if postcode:
+                gate["postcode"] = postcode
+            gates.append(gate)
+
+        normalized["semantic_gates"] = gates
+        return normalized
 
     @staticmethod
     def _merge_verification(det_dict: Dict[str, Any], llm_dict: Dict[str, Any], ambiguous: tuple) -> Dict[str, Any]:
@@ -5018,6 +5660,8 @@ RETRY #{attempt}: Your previous output was incomplete.
         Returns:
             Unified verification dict
         """
+        det_dict = MotherlabsEngine._normalize_verification_output(det_dict)
+        llm_dict = MotherlabsEngine._normalize_verification_output(llm_dict)
         merged = dict(det_dict)
         merged["verification_mode"] = "hybrid"
 
@@ -5034,8 +5678,35 @@ RETRY #{attempt}: Your previous output was incomplete.
             for d in core_dims
         )
         merged["status"] = "pass" if all_pass else "needs_work"
+        merged_gates: List[Dict[str, Any]] = []
+        seen_gates: set[tuple[str, str, str]] = set()
+        for gate_source in (
+            det_dict.get("semantic_gates", []) or [],
+            llm_dict.get("semantic_gates", []) or [],
+        ):
+            for gate in gate_source:
+                if not isinstance(gate, dict):
+                    continue
+                question = str(gate.get("question") or "").strip()
+                if not question:
+                    continue
+                gate_key = (
+                    str(
+                        gate.get("owner_component")
+                        or gate.get("node_ref")
+                        or gate.get("postcode")
+                        or question
+                    ).strip().lower(),
+                    question.lower(),
+                    str(gate.get("kind") or "semantic_gate").lower(),
+                )
+                if gate_key in seen_gates:
+                    continue
+                seen_gates.add(gate_key)
+                merged_gates.append(dict(gate))
+        merged["semantic_gates"] = merged_gates
 
-        return merged
+        return MotherlabsEngine._normalize_verification_output(merged)
 
     def _verify_hybrid(self, blueprint: Dict, state: SharedState) -> Dict[str, Any]:
         """
@@ -5058,7 +5729,7 @@ RETRY #{attempt}: Your previous output was incomplete.
         det_result = self._verify_deterministic(blueprint, state)
 
         if not det_result.needs_llm:
-            return to_verification_dict(det_result)
+            return self._normalize_verification_output(to_verification_dict(det_result))
 
         # Ambiguous — call LLM for just those dimensions
         llm_result = self._verify_llm_focused(
@@ -5077,6 +5748,7 @@ RETRY #{attempt}: Your previous output was incomplete.
         Re-synthesize to fill gaps identified by verification.
 
         Phase 8.3: Verification-driven re-synthesis.
+        Phase 28.1: Component enrichment for thin entities.
         Extracts actionable gaps, constructs focused prompt, merges result.
 
         Args:
@@ -5085,7 +5757,7 @@ RETRY #{attempt}: Your previous output was incomplete.
             state: SharedState for context
 
         Returns:
-            Improved blueprint with gaps filled
+            Improved blueprint with gaps filled and thin components enriched
         """
         # Extract actionable gaps with unique IDs (Build 7: resynthesis provenance)
         gaps = []
@@ -5132,7 +5804,10 @@ RETRY #{attempt}: Your previous output was incomplete.
                 gid = _next_gap_id()
                 gaps.append((gid, f"FIX: {f}"))
 
-        if not gaps:
+        # Phase 28.1: Identify thin components that need enrichment
+        thin_components = self._identify_thin_components(blueprint, verification)
+
+        if not gaps and not thin_components:
             return blueprint
 
         # Detect reachability gaps and build connectivity instructions
@@ -5161,39 +5836,220 @@ Do NOT create new bridge components — connect directly to existing ones."""
         # Format gaps with IDs for provenance tagging
         gap_lines = [f"- [{gid}] {desc}" for gid, desc in gaps[:15]]
 
-        gap_prompt = f"""VERIFICATION GAPS:
+        # Build the prompt sections
+        prompt_sections = []
+
+        if gap_lines:
+            prompt_sections.append(f"""VERIFICATION GAPS:
 The following gaps were found in the blueprint:
 {chr(10).join(gap_lines)}
-{connectivity_instruction}
-EXISTING COMPONENTS (do NOT repeat):
+{connectivity_instruction}""")
+
+        # Phase 28.1: Component enrichment section
+        if thin_components:
+            enrichment_lines = []
+            for tc in thin_components[:8]:
+                reasons = ", ".join(tc["reasons"])
+                enrichment_lines.append(f"- {tc['name']} ({tc['type']}): {reasons}")
+
+            prompt_sections.append(f"""COMPONENT ENRICHMENT:
+These existing components are structurally thin — they lack the operational detail
+that any expert would expect. Enrich each one with domain-appropriate additions:
+
+{chr(10).join(enrichment_lines)}
+
+For each thin component, output the FULL enriched component (same name, same type)
+with added methods, state_machine, and/or constraints. Think: "What would a senior
+engineer add during code review?"
+
+Rules for enrichment:
+- Entities with lifecycle descriptions → add state_machine with all states + transitions
+- Entities that are created/modified/deleted → add CRUD operations with preconditions
+- Processes that mutate data → add error handling constraints and side effect documentation
+- Any component with < 2 methods → add domain-appropriate operations
+- Set derived_from to "enrichment: domain invariant — [reason]" for added operations""")
+
+        prompt_sections.append(f"""EXISTING COMPONENTS:
 {chr(10).join(f'- {n}' for n in existing_names)}
 
-Add ONLY the missing components and relationships to address these gaps.
-Do NOT repeat existing components.
-PROVENANCE: For each new component, set derived_from to "resynthesis:<gap_id>|<original_source>"
-where <gap_id> is the [gap_N] that triggered this component (e.g. "resynthesis:gap_1|user input").
-This preserves the chain: intent → blueprint → verification gap → resynthesis.
-Output JSON: {{"components": [...], "relationships": [...], "constraints": [], "unresolved": []}}"""
+{'Add missing components/relationships for VERIFICATION GAPS.' if gap_lines else ''}
+{'Output enriched versions of thin components for COMPONENT ENRICHMENT.' if thin_components else ''}
+Do NOT remove or weaken existing content — only add.
+PROVENANCE: For new components, set derived_from to "resynthesis:<gap_id>|<original_source>".
+For enriched components, preserve existing derived_from and add new operations with
+"enrichment: domain invariant — [reason]" provenance.
+If a verification gap still needs a human decision after this pass, emit semantic_gates[] entries:
+  {{"owner_component": "ComponentName", "question": "...", "kind": "gap|semantic_conflict",
+     "options": ["..."], "stage": "verification"}}
+If you can confidently map a resolved region to postcode space, also emit semantic_nodes[] entries
+with: postcode, primitive, description, fill_state, confidence, connections[], source_ref[].
+Output JSON: {{"components": [...], "relationships": [...], "constraints": [], "unresolved": [], "semantic_gates": [], "semantic_nodes": []}}""")
+
+        full_prompt = "\n\n".join(prompt_sections)
 
         msg = Message(
             sender="System",
-            content=gap_prompt,
+            content=full_prompt,
             message_type=MessageType.PROPOSITION
         )
 
         response = self.synthesis_agent.run(state, msg, max_tokens=16384)
 
         try:
-            additions = self._extract_json(response.content)
+            additions = self._normalize_synthesis_output(
+                self._parse_structured_output(
+                    response.content,
+                    "synthesis_patch",
+                ),
+                run_id="verification-resynthesis",
+            )
             if additions.get("components") or additions.get("relationships"):
-                merged = self._merge_blueprints(blueprint, additions)
-                added_count = len(merged.get("components", [])) - len(blueprint.get("components", []))
-                if added_count > 0:
-                    self._emit_insight(f"Re-synthesis added {added_count} components")
-                return merged
+                # Separate enriched (same-name) from new components
+                enriched_names = {tc["name"].lower() for tc in thin_components}
+                enriched_components = []
+                new_components = []
+                for comp in additions.get("components", []):
+                    if comp.get("name", "").lower() in enriched_names:
+                        enriched_components.append(comp)
+                    else:
+                        new_components.append(comp)
+
+                # Apply enrichments by replacing thin components with enriched versions
+                if enriched_components:
+                    blueprint = self._apply_enrichments(blueprint, enriched_components)
+                    self._emit_insight(
+                        f"Enriched {len(enriched_components)} thin component(s) with domain operations"
+                    )
+
+                # Merge new components as before
+                if new_components or additions.get("relationships"):
+                    new_additions = dict(additions)
+                    new_additions["components"] = new_components
+                    merged = self._merge_blueprints(blueprint, new_additions)
+                    added_count = len(merged.get("components", [])) - len(blueprint.get("components", []))
+                    if added_count > 0:
+                        self._emit_insight(f"Re-synthesis added {added_count} component(s)")
+                    return merged
+
+                return blueprint
         except Exception as e:
             logger.warning(f"Re-synthesis parse failed: {e}")
 
+        return blueprint
+
+    @staticmethod
+    def _identify_thin_components(
+        blueprint: Dict[str, Any],
+        verification: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """
+        Identify components that are structurally thin and need enrichment.
+
+        Phase 28.1: A component is thin if it lacks operational detail that
+        any domain expert would expect. This is the mechanism by which implied
+        knowledge gets excavated during re-synthesis.
+
+        Returns list of dicts with 'name', 'type', 'reasons' for each thin component.
+        """
+        thin = []
+        components = blueprint.get("components", [])
+
+        # Verification dimensional scores help target weakness
+        actionability = verification.get("coherence", {}).get("score", 100)
+        specificity_low = actionability < 65
+
+        for comp in components:
+            name = comp.get("name", "")
+            comp_type = comp.get("type", "entity")
+            methods = comp.get("methods", [])
+            state_machine = comp.get("state_machine")
+            description = comp.get("description", "").lower()
+            reasons = []
+
+            # Entity/agent with fewer than 2 methods
+            if comp_type in ("entity", "agent", "process") and len(methods) < 2:
+                reasons.append(f"only {len(methods)} method(s) — needs domain operations")
+
+            # Entity with lifecycle language but no state machine
+            lifecycle_words = {"lifecycle", "workflow", "status", "state", "phase",
+                               "stage", "progress", "transition", "flow",
+                               "booking", "order", "task", "ticket", "request",
+                               "subscription", "session", "job", "payment",
+                               "invoice", "appointment", "reservation"}
+            has_lifecycle_hint = any(w in description or w in name.lower() for w in lifecycle_words)
+            if has_lifecycle_hint and not state_machine and comp_type != "interface":
+                reasons.append("lifecycle entity without state machine")
+
+            # Process with no constraints
+            if comp_type == "process":
+                has_constraints = any(
+                    name.lower() in str(c.get("applies_to", [])).lower()
+                    for c in blueprint.get("constraints", [])
+                )
+                if not has_constraints and len(methods) < 3:
+                    reasons.append("process without preconditions or guards")
+
+            # Generic description (too vague)
+            vague_patterns = ["manages", "handles", "responsible for", "oversees",
+                              "coordinates", "service for"]
+            if any(p in description for p in vague_patterns) and len(methods) < 3:
+                reasons.append("vague description with insufficient operational detail")
+
+            if reasons:
+                thin.append({
+                    "name": name,
+                    "type": comp_type,
+                    "reasons": reasons,
+                })
+
+        return thin
+
+    @staticmethod
+    def _apply_enrichments(
+        blueprint: Dict[str, Any],
+        enriched_components: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Replace thin components with their enriched versions.
+
+        Phase 28.1: Merges enriched methods, state_machines, and constraints
+        into existing components without losing existing content.
+        """
+        enriched_map = {c["name"].lower(): c for c in enriched_components}
+        components = blueprint.get("components", [])
+        updated = []
+
+        for comp in components:
+            name_lower = comp.get("name", "").lower()
+            if name_lower in enriched_map:
+                enriched = enriched_map[name_lower]
+
+                # Merge methods: keep existing, add new ones by name
+                existing_methods = {m.get("name", ""): m for m in comp.get("methods", [])}
+                for method in enriched.get("methods", []):
+                    method_name = method.get("name", "")
+                    if method_name not in existing_methods:
+                        existing_methods[method_name] = method
+                comp["methods"] = list(existing_methods.values())
+
+                # Adopt state machine if component didn't have one
+                if not comp.get("state_machine") and enriched.get("state_machine"):
+                    comp["state_machine"] = enriched["state_machine"]
+
+                # Merge attributes
+                if enriched.get("attributes"):
+                    existing_attrs = comp.get("attributes", {})
+                    existing_attrs.update(enriched["attributes"])
+                    comp["attributes"] = existing_attrs
+
+                updated.append(comp)
+            else:
+                updated.append(comp)
+
+        blueprint["components"] = updated
+
+        # Merge any new constraints from enrichment
+        # (constraints targeting enriched components)
         return blueprint
 
     @staticmethod
@@ -5211,6 +6067,12 @@ Output JSON: {{"components": [...], "relationships": [...], "constraints": [], "
         relationships = blueprint.get("relationships", [])
 
         declared = {c["name"].lower() for c in components}
+        for c in components:
+            if c.get("type") == "subsystem" and c.get("sub_blueprint"):
+                for sub_c in c["sub_blueprint"].get("components", []):
+                    sub_name = sub_c.get("name", "")
+                    if sub_name:
+                        declared.add(sub_name.lower())
         promoted = 0
 
         for rel in relationships:
@@ -5268,6 +6130,8 @@ Output JSON: {{"components": [...], "relationships": [...], "constraints": [], "
         merged["relationships"] = list(original.get("relationships", []))
         merged["constraints"] = list(original.get("constraints", []))
         merged["unresolved"] = list(original.get("unresolved", []))
+        merged["semantic_gates"] = list(original.get("semantic_gates", []))
+        merged["semantic_nodes"] = list(original.get("semantic_nodes", []))
 
         # Dedup components by normalized name
         existing_names = {
@@ -5301,6 +6165,62 @@ Output JSON: {{"components": [...], "relationships": [...], "constraints": [], "
         for u in additions.get("unresolved", []):
             if u not in merged["unresolved"]:
                 merged["unresolved"].append(u)
+
+        # Merge semantic gates by question + owner identity
+        existing_gates = {
+            (
+                str(
+                    gate.get("node_ref")
+                    or gate.get("owner_component")
+                    or gate.get("postcode")
+                    or gate.get("question")
+                    or ""
+                ).strip().lower(),
+                str(gate.get("question") or "").strip().lower(),
+            )
+            for gate in merged["semantic_gates"]
+            if isinstance(gate, dict)
+        }
+        for gate in additions.get("semantic_gates", []):
+            if not isinstance(gate, dict):
+                continue
+            key = (
+                str(
+                    gate.get("node_ref")
+                    or gate.get("owner_component")
+                    or gate.get("postcode")
+                    or gate.get("question")
+                    or ""
+                ).strip().lower(),
+                str(gate.get("question") or "").strip().lower(),
+            )
+            if key in existing_gates:
+                continue
+            existing_gates.add(key)
+            merged["semantic_gates"].append(gate)
+
+        # Merge semantic nodes by node_ref if present, else postcode + primitive
+        existing_nodes = {
+            (
+                str(node.get("node_ref") or "").strip().lower(),
+                str(node.get("postcode") or "").strip().lower(),
+                str(node.get("primitive") or node.get("name") or "").strip().lower(),
+            )
+            for node in merged["semantic_nodes"]
+            if isinstance(node, dict)
+        }
+        for node in additions.get("semantic_nodes", []):
+            if not isinstance(node, dict):
+                continue
+            key = (
+                str(node.get("node_ref") or "").strip().lower(),
+                str(node.get("postcode") or "").strip().lower(),
+                str(node.get("primitive") or node.get("name") or "").strip().lower(),
+            )
+            if key in existing_nodes:
+                continue
+            existing_nodes.add(key)
+            merged["semantic_nodes"].append(node)
 
         return merged
 
@@ -5770,19 +6690,8 @@ be preserved. Challenge before agreeing. Make all unknowns explicit.
         """
         substrate = self._detect_substrate_summary()
 
-        # Append real source structure from AST analysis
+        # Source structure from AST analysis (placeholder — source_reader removed with mother/ cleanup)
         source_structure = ""
-        try:
-            from mother.source_reader import read_codebase, format_source_summary
-            import os
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            snapshot = read_codebase(project_root)
-            source_structure = (
-                "\n\n## SOURCE STRUCTURE (from AST)\n"
-                + format_source_summary(snapshot, max_words=4000)
-            )
-        except Exception as e:
-            logger.debug(f"Source structure unavailable: {e}")
         return f"""Mother is a cognitive entity that runs on a local machine. She is not a tool,
 not a chatbot, not an app. She is a semantic compiler with senses, memory,
 autonomy, and the capacity for self-modification.
@@ -6214,6 +7123,9 @@ AXIOMS: Excavation > Generation. Compression > Expansion. Trust through Provenan
         if config is None:
             config = EmissionConfig()
 
+        # Normalize string elements in stored blueprints before any .get() calls
+        blueprint = normalize_blueprint_elements(blueprint)
+
         # Phase 17.2: Blueprint health gate before emission
         from core.blueprint_health import check_blueprint_health
         health = check_blueprint_health(blueprint)
@@ -6320,7 +7232,8 @@ AXIOMS: Excavation > Generation. Compression > Expansion. Trust through Provenan
             )
             batch_emissions.append(be)
 
-        result = assemble_emission(batch_emissions, interface_map, l2_injected)
+        result = assemble_emission(batch_emissions, interface_map, l2_injected,
+                                   blueprint=getattr(self, '_current_blueprint', None))
         self._emit_insight(
             f"Emission complete: {result.success_count}/{result.total_nodes} succeeded, "
             f"verification pass_rate={result.pass_rate:.0%}"
@@ -6597,7 +7510,8 @@ AXIOMS: Excavation > Generation. Compression > Expansion. Trust through Provenan
         all_batch_emissions = deduped_batch_emissions
 
         # Assemble result
-        result = assemble_emission(all_batch_emissions, interface_map, l2_injected)
+        result = assemble_emission(all_batch_emissions, interface_map, l2_injected,
+                                   blueprint=blueprint)
 
         # Wrap with layer metadata by creating new EmissionResult
         from core.agent_emission import EmissionResult

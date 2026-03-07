@@ -2,6 +2,11 @@
 // API Types — mirrors api/v2/models.py + core/schema.py
 // =============================================================================
 
+import type {
+  BlueprintNode as SemanticBlueprintNode,
+  GovernanceReport as SemanticGovernanceReport,
+} from '../semantic/protocol';
+
 // --- Enums ---
 
 export type ComponentType = 'entity' | 'process' | 'interface' | 'event' | 'constraint' | 'subsystem';
@@ -12,9 +17,38 @@ export type RelationshipType =
 
 export type VerificationBadge = 'verified' | 'partial' | 'unverified';
 
-export type TaskStatus = 'pending' | 'running' | 'complete' | 'error' | 'cancelled';
+export type TaskStatus = 'pending' | 'running' | 'awaiting_decision' | 'complete' | 'error' | 'cancelled';
 
 export type TrustLevel = 'fast' | 'standard' | 'thorough';
+
+// Glass box: structured compilation emissions
+export type InsightCategory = 'discovery' | 'decision' | 'warning' | 'metric' | 'resolution' | 'status';
+
+export interface StructuredInsight {
+  text: string;
+  category: InsightCategory;
+  stage: string;
+  metrics: Record<string, number>;
+  reasoning: string;
+  timestamp: number;
+}
+
+export interface DifficultySignal {
+  input_quality: number;
+  unknown_count: number;
+  conflict_count: number;
+  ambiguity_count: number;
+  component_complexity: number;
+  irritation_depth: number;
+}
+
+export interface StageResultSummary {
+  stage: string;
+  success: boolean;
+  errors: string[];
+  warnings: string[];
+  retries: number;
+}
 
 // --- Blueprint Schema ---
 
@@ -58,12 +92,18 @@ export interface BlueprintComponent {
   validation_rules: string[];
 }
 
+export type Cardinality = '1:1' | '1:N' | 'N:1' | 'N:M' | '';
+
 export interface BlueprintRelationship {
-  from_component: string;
-  to_component: string;
+  // API may return either `from`/`to` or `from_component`/`to_component`
+  from_component?: string;
+  to_component?: string;
+  from?: string;
+  to?: string;
   type: RelationshipType;
   description: string;
   derived_from: string;
+  cardinality?: Cardinality;
 }
 
 export interface BlueprintConstraint {
@@ -72,12 +112,27 @@ export interface BlueprintConstraint {
   derived_from: string;
 }
 
+export interface AcknowledgedUnknown {
+  original: string;
+  reason: string;
+  default_applied: string | null;
+}
+
+export interface Resolution {
+  original: string;
+  resolution: string;
+  evidence: string[];
+  type: 'context_match' | 'structural' | 'default_applied';
+}
+
 export interface Blueprint {
   components: BlueprintComponent[];
   relationships: BlueprintRelationship[];
   constraints: BlueprintConstraint[];
   unresolved: string[];
   core_need?: string;
+  acknowledged_unknowns?: AcknowledgedUnknown[];
+  resolutions?: Resolution[];
 }
 
 // --- Trust ---
@@ -117,19 +172,62 @@ export interface UsageResponse {
   adapter_version: string;
 }
 
+export interface TerminationSemanticProgress {
+  fingerprint_changed?: boolean;
+  verification_score_delta?: number;
+  components_delta?: number;
+  gates_changed?: boolean;
+}
+
+export interface TerminationCondition {
+  status?: 'awaiting_human' | 'stalled' | 'halted' | 'complete' | string;
+  reason?: string;
+  message?: string;
+  next_action?: string;
+  semantic_progress?: TerminationSemanticProgress;
+}
+
 export interface CompileResponse {
   success: boolean;
   blueprint: Blueprint;
-  materialized_output: Record<string, string>;
+  semantic_nodes?: SemanticBlueprintNode[];
+  termination_condition?: TerminationCondition;
+  governance_report?: SemanticGovernanceReport;
+  materialized_output?: Record<string, string>;
   trust: TrustResponse;
-  dimensional_metadata: Record<string, unknown>;
-  interface_map: Record<string, unknown>;
-  verification: Record<string, unknown>;
-  context_graph: Record<string, unknown>;
+  dimensional_metadata?: Record<string, unknown>;
+  interface_map?: Record<string, unknown>;
+  verification?: Record<string, unknown>;
+  context_graph?: Record<string, unknown>;
   domain: string;
-  adapter_version: string;
-  usage: UsageResponse;
+  adapter_version?: string;
+  duration_seconds?: number;
+  usage?: UsageResponse;
   error?: string | null;
+  // Feature 1: Visible Provenance
+  input_text?: string;
+  // Feature 3: Runnable Output
+  project_files?: Record<string, string>;
+  entry_point?: string;
+  project_name?: string;
+  // YAML output tree (fractal blueprint)
+  yaml_output?: Record<string, string>;
+  // Glass box: structured compilation emissions
+  structured_insights?: StructuredInsight[];
+  difficulty?: DifficultySignal;
+  stage_results?: StageResultSummary[];
+  stage_timings?: Record<string, number>;
+  retry_counts?: Record<string, number>;
+  fracture?: {
+    stage: string;
+    competing_configs?: string[];
+    collapsing_constraint: string;
+    agent?: string;
+    context?: string;
+  } | null;
+  interrogation?: Record<string, unknown>;
+  // Compilation quality benchmark
+  benchmark?: BenchmarkResponse;
 }
 
 export interface AsyncCompileResponse {
@@ -138,11 +236,76 @@ export interface AsyncCompileResponse {
   poll_url: string;
 }
 
+export interface CompilationProgress {
+  current_stage: string;
+  stage_index: number;
+  total_stages: number;
+  insights: string[];
+  structured_insights?: StructuredInsight[];
+  difficulty?: DifficultySignal;
+  termination_condition?: TerminationCondition;
+  escalations?: Array<{
+    postcode: string;
+    question: string;
+    answer?: string;
+    options?: string[];
+    node_ref?: string | null;
+    kind?: string;
+    stage?: string;
+  }>;
+  human_decisions?: Array<{ postcode: string; question: string; answer: string; timestamp: string }>;
+}
+
 export interface TaskStatusResponse {
   task_id: string;
   status: TaskStatus;
   result?: CompileResponse | null;
   error?: string | null;
+  progress?: CompilationProgress | null;
+}
+
+export interface TaskDecisionRequest {
+  postcode: string;
+  question: string;
+  answer: string;
+  timestamp?: string | null;
+}
+
+export interface TaskDecisionResponse {
+  task_id: string;
+  saved: boolean;
+  progress?: CompilationProgress | null;
+  next_task_id?: string | null;
+  termination_condition?: TerminationCondition | null;
+}
+
+// Feature 5: Corpus Benchmarking
+export interface CorpusBenchmarkResponse {
+  domain: string;
+  total_compilations: number;
+  avg_component_count: number;
+  avg_trust_score: number;
+  avg_gap_count: number;
+}
+
+// --- Benchmark (Compilation Quality) ---
+
+export interface BenchmarkDimensionScore {
+  dimension: string;
+  weight: number;
+  score: number;
+  target: number;
+  gap: number;
+  met: boolean;
+}
+
+export interface BenchmarkResponse {
+  dimensions: Record<string, number>;
+  composite_score: number;
+  composite_pct: number;
+  gen_label: string;
+  scorecard: BenchmarkDimensionScore[];
+  details: Record<string, unknown>;
 }
 
 // --- Health ---
@@ -182,21 +345,66 @@ export interface DomainListResponse {
 
 // --- Corpus ---
 
-export interface CompilationRecord {
+// Summary record returned by GET /v1/corpus (list endpoint)
+export interface CompilationRecordSummary {
   id: string;
-  description: string;
+  input_text: string;
   domain: string;
   timestamp: string;
-  blueprint: Blueprint;
-  trust: TrustResponse;
-  materialized_output: Record<string, string>;
-  component_count?: number;
-  relationship_count?: number;
+  components_count: number;
+  insights_count: number;
+  success: boolean;
+  provider: string;
+  model: string;
+}
+
+// Full record assembled from GET /v1/corpus/{id} (detail endpoint)
+export interface CompilationRecordDetail {
+  record: CompilationRecordSummary;
+  blueprint: Blueprint | null;
+  context_graph: Record<string, unknown> | null;
 }
 
 export interface CorpusListResponse {
-  compilations: CompilationRecord[];
+  records: CompilationRecordSummary[];
   total: number;
   page: number;
-  page_size: number;
+  per_page: number;
 }
+
+export type {
+  BlueprintMetadata,
+  BlueprintNode,
+  CompiledBlueprint,
+  ConcernCode,
+  ContextBudget,
+  CostReport,
+  DepthReport,
+  DimensionCode,
+  DomainCode,
+  FillStateCode,
+  GovernanceReport,
+  IntentContract,
+  LayerCode,
+  LayerCoverage,
+  NodeRef,
+  NodeReferences,
+  NodeStatusCode,
+  Postcode,
+  ScopeCode,
+  Silence,
+} from '../semantic/protocol';
+
+export {
+  BLUEPRINTS_SSOT_DATE,
+  BLUEPRINTS_SSOT_VERSION,
+  effectiveConfidence,
+  isNodeRef,
+  isPostcode,
+  makeNodeRef,
+  normalizeNodeName,
+  normalizeBlueprintNode,
+  parseNodeRef,
+  parsePostcode,
+  parseSemanticRef,
+} from '../semantic/protocol';

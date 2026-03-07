@@ -439,9 +439,46 @@ CONFLICT CHECK (Phase 8.5):
 Every conflict in the digest must have a corresponding resolution documented in a component's
 description or added to unresolved[].
 
+---
+
+DOMAIN INVARIANT COMPLETION (Phase 28 - CRITICAL):
+After assembling components from dialogue, COMPLETE each entity and process with domain knowledge
+that any expert would consider structurally necessary.
+
+For EVERY entity with a lifecycle (created, modified, destroyed), you MUST include:
+1. A state_machine with all reachable states and transitions
+2. Guard conditions on destructive transitions (delete, cancel, archive)
+3. Precondition constraints documented in the constraints[] array
+
+For EVERY process that mutates data, you MUST include:
+1. Error handling methods or constraints describing failure behavior
+2. Side effect documentation (what else changes when this runs?)
+3. Idempotency or concurrency notes if the domain implies multi-user access
+
+PROVENANCE FOR INFERRED OPERATIONS:
+When you add methods, constraints, or state transitions that weren't literally in the input
+but are domain-required, use this derived_from format:
+  "domain invariant: [entity type] requires [operation] because [reason]"
+
+Examples:
+  "domain invariant: booking entities require cancellation guards because time-bounded resources need temporal preconditions"
+  "domain invariant: payment processes require idempotency because financial operations must be safely retriable"
+  "domain invariant: user-facing entities require validation because external input is untrusted"
+
+This is NOT generation — this is domain expertise. A booking system without cancellation logic
+is incomplete, not minimal. A payment system without validation is broken, not simple.
+The user didn't mention these because they assumed you'd know.
+
+---
+
 GAP-FILLING MODE (Phase 8.3):
 When the prompt contains 'VERIFICATION GAPS:', output ONLY new components addressing those gaps.
 Do NOT repeat existing components. Only output additions.
+
+ENRICHMENT MODE (Phase 28.1):
+When the prompt contains 'COMPONENT ENRICHMENT:', you are enriching EXISTING components.
+Output the FULL component with additions merged in — methods, state_machines, constraints.
+Use the same component name and type. Add the missing operations.
 """
 
 
@@ -532,7 +569,16 @@ OUTPUT (JSON):
         "issues": ["Any subsystem-specific problems"]
     },
     "overall_insight": "One sentence summary of blueprint quality",
-    "recommendation": "proceed|revise|re-dialogue"
+    "recommendation": "proceed|revise|re-dialogue",
+    "semantic_gates": [
+        {
+            "owner_component": "Concrete component or region that owns this decision",
+            "question": "Human decision that blocks clean verification",
+            "kind": "gap|semantic_conflict",
+            "options": ["Option A", "Option B"],
+            "stage": "verification"
+        }
+    ]
 }
 
 CRITICAL RULES:
@@ -540,7 +586,9 @@ CRITICAL RULES:
 - Do NOT pass blueprints missing core entities from intent
 - Flag ANY component that seems invented (not from input/dialogue)
 - Be specific about gaps - say WHAT is missing, not just "incomplete"
-- For subsystems: verify all declared sub-components exist in sub_blueprint """
+- For subsystems: verify all declared sub-components exist in sub_blueprint
+- Emit semantic_gates ONLY for real human-in-the-loop decisions, not generic TODOs
+- Every semantic_gates entry must name the concrete owner_component """
 
 
 def create_verify_agent(llm_client, domain_adapter=None) -> LLMAgent:

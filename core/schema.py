@@ -145,14 +145,52 @@ class StateSpec:
     derived_from: str = ""
 
     def validate(self) -> List[str]:
-        """Return list of validation errors."""
+        """Return list of validation errors including completeness checks."""
         errors = []
         if not self.states:
             errors.append("StateSpec has no states defined")
+            return errors
         if self.initial_state and self.initial_state not in self.states:
             errors.append(f"StateSpec initial_state '{self.initial_state}' not in states list")
+        if not self.initial_state:
+            errors.append("StateSpec missing initial_state")
         if not self.derived_from:
             errors.append("StateSpec missing derived_from")
+
+        # Completeness checks
+        if self.states and self.transitions:
+            # Check all transition states reference declared states
+            for t in self.transitions:
+                if t.from_state not in self.states:
+                    errors.append(f"Transition from undeclared state '{t.from_state}'")
+                if t.to_state not in self.states:
+                    errors.append(f"Transition to undeclared state '{t.to_state}'")
+
+            # Reachability: all states reachable from initial_state
+            if self.initial_state:
+                reachable = {self.initial_state}
+                changed = True
+                while changed:
+                    changed = False
+                    for t in self.transitions:
+                        if t.from_state in reachable and t.to_state not in reachable:
+                            reachable.add(t.to_state)
+                            changed = True
+                unreachable = set(self.states) - reachable
+                for s in unreachable:
+                    errors.append(f"State '{s}' unreachable from initial state '{self.initial_state}'")
+
+            # Dead-end states: states with no outbound transitions (terminal states)
+            # This is a warning, not an error — terminal states are valid
+            states_with_outbound = {t.from_state for t in self.transitions}
+            terminal_states = set(self.states) - states_with_outbound
+            # At least one terminal state should exist (otherwise infinite loop)
+            if not terminal_states and len(self.states) > 1:
+                errors.append("No terminal states — state machine has no completion path")
+
+        elif self.states and not self.transitions:
+            errors.append("StateSpec has states but no transitions defined")
+
         return errors
 
 
@@ -219,13 +257,21 @@ class ComponentSchema:
 
 def _fuzzy_match_component(name: str, component_names: Set[str]) -> bool:
     """
-    Check if a component name matches any known component (fuzzy).
+    Check if a component name matches any known component.
 
-    Handles cases like:
-    - 'Agents' matching 'Intent Agent', 'Process Agent', etc.
-    - 'SharedState.History' matching 'SharedState' or 'History'
-    - 'Messages' matching 'Message'
+    Handles:
+    - Exact match (case-insensitive)
+    - Plural/singular ('Messages' -> 'Message')
+    - Dotted notation ('SharedState.History' -> 'SharedState')
+    - Substring match where the name is a significant part of a component name
+
+    Does NOT accept:
+    - Generic names like 'system', 'all', 'components' (these hide real errors)
+    - Broad substring matches like 'agent' matching any agent
     """
+    if not name or not name.strip():
+        return False
+
     name_lower = name.lower().strip()
 
     # Exact match
@@ -250,17 +296,45 @@ def _fuzzy_match_component(name: str, component_names: Set[str]) -> bool:
             if part.lower() in component_names_lower:
                 return True
 
-    # Generic names that likely refer to a group
-    generic_names = {'agents', 'all agents', 'all', 'system', 'all components', 'components'}
-    if name_lower in generic_names:
-        return True  # Allow generic references
-
-    # Partial match (Agent in name and any agent exists)
-    if 'agent' in name_lower:
-        if any('agent' in c.lower() for c in component_names):
-            return True
+    # Substring: name is a significant suffix/prefix of a real component
+    # e.g. "Booking" matches "BookingService", "UserBooking"
+    # Only if the name is >= 4 chars (avoid matching "a", "id", etc.)
+    if len(name_lower) >= 4:
+        for comp_lower in component_names_lower:
+            # name is a word-boundary substring of a component name
+            if comp_lower.startswith(name_lower) or comp_lower.endswith(name_lower):
+                return True
+            # component name is a word-boundary substring of the reference
+            if name_lower.startswith(comp_lower) or name_lower.endswith(comp_lower):
+                return True
 
     return False
+
+
+def _infer_cardinality(rel: 'RelationshipSchema') -> str:
+    """Infer cardinality from relationship type when not explicitly set.
+
+    Rules:
+    - contains: 1:N (a container holds many items)
+    - triggers/generates/propagates: 1:N (one source, many targets possible)
+    - accesses/depends_on: N:1 (many consumers, one provider)
+    - flows_to/bidirectional: 1:1 (default for sequential/symmetric)
+    - snapshots/constrained_by: 1:1
+    """
+    type_map = {
+        "contains": "1:N",
+        "triggers": "1:N",
+        "generates": "1:N",
+        "propagates": "1:N",
+        "accesses": "N:1",
+        "depends_on": "N:1",
+        "flows_to": "1:1",
+        "bidirectional": "1:1",
+        "snapshots": "1:1",
+        "constrained_by": "1:1",
+    }
+    rel_type = rel.type.value if hasattr(rel.type, 'value') else str(rel.type)
+    return type_map.get(rel_type, "1:1")
 
 
 @dataclass
@@ -273,6 +347,7 @@ class RelationshipSchema:
     type: RelationshipType                       # Must be valid type
     description: str                             # Nature of relationship
     derived_from: str = ""                       # Optional derivation
+    cardinality: str = ""                        # "1:1", "1:N", "N:1", "N:M" or "" if unspecified
 
     def validate(self, component_names: Set[str]) -> List[str]:
         """Return list of validation errors with fuzzy matching."""
@@ -326,6 +401,8 @@ class BlueprintSchema:
     relationships: List[RelationshipSchema] = field(default_factory=list)
     constraints: List[ConstraintSchema] = field(default_factory=list)
     unresolved: List[str] = field(default_factory=list)
+    semantic_gates: List[Dict[str, Any]] = field(default_factory=list)
+    semantic_nodes: List[Dict[str, Any]] = field(default_factory=list)
 
     def validate(self) -> Dict[str, Any]:
         """
@@ -488,11 +565,12 @@ class BlueprintSchema:
                 rel_type = RelationshipType.DEPENDS_ON  # Default
 
             relationships.append(RelationshipSchema(
-                from_component=r.get("from", ""),
-                to_component=r.get("to", ""),
+                from_component=r.get("from", "") or r.get("from_component", ""),
+                to_component=r.get("to", "") or r.get("to_component", ""),
                 type=rel_type,
                 description=r.get("description", ""),
-                derived_from=r.get("derived_from", "")
+                derived_from=r.get("derived_from", ""),
+                cardinality=r.get("cardinality", ""),
             ))
 
         constraints = []
@@ -507,7 +585,9 @@ class BlueprintSchema:
             components=components,
             relationships=relationships,
             constraints=constraints,
-            unresolved=data.get("unresolved", [])
+            unresolved=data.get("unresolved", []),
+            semantic_gates=data.get("semantic_gates", []),
+            semantic_nodes=data.get("semantic_nodes", []),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -569,7 +649,8 @@ class BlueprintSchema:
                     "from": r.from_component,
                     "to": r.to_component,
                     "type": r.type.value,
-                    "description": r.description
+                    "description": r.description,
+                    "cardinality": r.cardinality or _infer_cardinality(r),
                 }
                 for r in self.relationships
             ],
@@ -581,7 +662,9 @@ class BlueprintSchema:
                 }
                 for c in self.constraints
             ],
-            "unresolved": self.unresolved
+            "unresolved": self.unresolved,
+            "semantic_gates": self.semantic_gates,
+            "semantic_nodes": self.semantic_nodes,
         }
 
 
@@ -2140,6 +2223,30 @@ def deduplicate_blueprint(blueprint: Dict[str, Any]) -> tuple:
         else:
             report["relationship_dupes_removed"] += 1
 
+    # Phase 3b: Pair-level dedup — same (from, to) with different types → keep most descriptive
+    seen_pairs: Dict[Tuple[str, str], int] = {}
+    pair_dedup_relationships: list = []
+    pair_dupes_removed = 0
+    for rel in dedup_relationships:
+        pair = (
+            rel.get("from", "").lower().strip(),
+            rel.get("to", "").lower().strip(),
+        )
+        if pair in seen_pairs:
+            existing_idx = seen_pairs[pair]
+            existing = pair_dedup_relationships[existing_idx]
+            existing_len = len(existing.get("description", ""))
+            new_len = len(rel.get("description", ""))
+            if new_len > existing_len:
+                pair_dedup_relationships[existing_idx] = rel
+            pair_dupes_removed += 1
+        else:
+            seen_pairs[pair] = len(pair_dedup_relationships)
+            pair_dedup_relationships.append(rel)
+
+    dedup_relationships = pair_dedup_relationships
+    report["relationship_dupes_removed"] += pair_dupes_removed
+
     report["total_removed"] = (
         len(report["name_dupes_removed"])
         + len(report["containment_dupes_removed"])
@@ -2151,3 +2258,54 @@ def deduplicate_blueprint(blueprint: Dict[str, Any]) -> tuple:
     cleaned["relationships"] = dedup_relationships
 
     return cleaned, report
+
+
+def normalize_blueprint_elements(blueprint: Dict[str, Any]) -> Dict[str, Any]:
+    """Coerce string elements in blueprint arrays to proper dicts.
+
+    LLM synthesis sometimes returns plain strings instead of structured dicts
+    (e.g. ["AuthService"] instead of [{"name": "AuthService", ...}]).
+    Every downstream function calls .get() assuming dicts, so strings crash.
+
+    This gate normalizes before any .get() calls happen.
+    Dict elements pass through unchanged.
+    """
+    result = dict(blueprint)
+
+    # Components: str → {"name": str, "type": "component", "description": ""}
+    components = result.get("components", [])
+    if isinstance(components, list):
+        result["components"] = [
+            {"name": c, "type": "component", "description": ""} if isinstance(c, str)
+            else c
+            for c in components
+        ]
+
+    # Relationships: str → {"from": "", "to": "", "type": str, "description": str}
+    relationships = result.get("relationships", [])
+    if isinstance(relationships, list):
+        result["relationships"] = [
+            {"from": "", "to": "", "type": r, "description": r} if isinstance(r, str)
+            else r
+            for r in relationships
+        ]
+
+    # Constraints: str → {"description": str, "applies_to": []}
+    constraints = result.get("constraints", [])
+    if isinstance(constraints, list):
+        result["constraints"] = [
+            {"description": c, "applies_to": []} if isinstance(c, str)
+            else c
+            for c in constraints
+        ]
+
+    # Unresolved: str → {"description": str}
+    unresolved = result.get("unresolved", [])
+    if isinstance(unresolved, list):
+        result["unresolved"] = [
+            {"description": u} if isinstance(u, str)
+            else u
+            for u in unresolved
+        ]
+
+    return result

@@ -39,6 +39,7 @@ LAYERS = frozenset({
     "CTR",  # Control
     "RES",  # Resource
     "OBS",  # Observability
+    "SEC",  # Security
     "NET",  # Network
     "EMG",  # Emergence
     "MET",  # Meta

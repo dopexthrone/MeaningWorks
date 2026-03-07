@@ -489,6 +489,40 @@ class TestBlueprintSchemaConversion:
         result_names = {c["name"] for c in result["components"]}
         assert original_names == result_names
 
+    def test_roundtrip_preserves_semantic_gates(self, sample_blueprint):
+        sample_blueprint["semantic_gates"] = [
+            {
+                "owner_component": sample_blueprint["components"][0]["name"],
+                "question": "Clarify fallback provider",
+                "kind": "gap",
+                "options": ["Anthropic", "OpenAI"],
+                "stage": "verification",
+            }
+        ]
+        schema = BlueprintSchema.from_dict(sample_blueprint)
+        result = schema.to_dict()
+
+        assert result["semantic_gates"][0]["owner_component"] == sample_blueprint["components"][0]["name"]
+        assert result["semantic_gates"][0]["kind"] == "gap"
+
+    def test_roundtrip_preserves_semantic_nodes(self, sample_blueprint):
+        sample_blueprint["semantic_nodes"] = [
+            {
+                "postcode": "STR.ENT.APP.WHAT.SFT",
+                "primitive": sample_blueprint["components"][0]["name"],
+                "description": sample_blueprint["components"][0]["description"],
+                "fill_state": "F",
+                "confidence": 0.92,
+                "connections": [],
+                "source_ref": [sample_blueprint["components"][0]["derived_from"]],
+            }
+        ]
+        schema = BlueprintSchema.from_dict(sample_blueprint)
+        result = schema.to_dict()
+
+        assert result["semantic_nodes"][0]["postcode"] == "STR.ENT.APP.WHAT.SFT"
+        assert result["semantic_nodes"][0]["primitive"] == sample_blueprint["components"][0]["name"]
+
 
 class TestFromDictStringCoercion:
     """Test that from_dict handles LLM output where params/methods are strings."""
@@ -577,7 +611,13 @@ class TestStateSpec:
                     to_state="ACTIVE",
                     trigger="start",
                     derived_from="test"
-                )
+                ),
+                Transition(
+                    from_state="ACTIVE",
+                    to_state="HALTED",
+                    trigger="stop",
+                    derived_from="test"
+                ),
             ],
             derived_from="State machine from spec"
         )
@@ -730,8 +770,30 @@ class TestDeduplicateBlueprint:
             ],
         }
         cleaned, report = deduplicate_blueprint(bp)
-        assert len(cleaned["relationships"]) == 2  # 1 duplicate removed
-        assert report["relationship_dupes_removed"] == 1
+        # Triple dedup removes 1 (A→B triggers dup), pair dedup collapses
+        # remaining (A→B triggers) + (A→B accesses) into 1 → total 1 surviving
+        assert len(cleaned["relationships"]) == 1
+        assert report["relationship_dupes_removed"] == 2  # 1 triple + 1 pair
+
+    def test_relationship_pair_dedup(self):
+        """Same pair with different types should be collapsed, keeping most descriptive."""
+        bp = {
+            "components": [
+                {"name": "A", "type": "entity", "description": "A", "derived_from": "input"},
+                {"name": "B", "type": "entity", "description": "B", "derived_from": "input"},
+                {"name": "C", "type": "entity", "description": "C", "derived_from": "input"},
+            ],
+            "relationships": [
+                {"from": "A", "to": "B", "type": "uses", "description": "short"},
+                {"from": "A", "to": "B", "type": "depends_on", "description": "A depends on B for data access"},
+                {"from": "A", "to": "C", "type": "triggers", "description": "A triggers C"},
+            ],
+        }
+        cleaned, report = deduplicate_blueprint(bp)
+        assert len(cleaned["relationships"]) == 2  # A→B collapsed, A→C kept
+        # The kept A→B should be the more descriptive one
+        ab_rel = [r for r in cleaned["relationships"] if r["to"] == "B"][0]
+        assert "depends on" in ab_rel["description"]
 
     def test_preserves_derived_from(self):
         """Dedup should not lose derived_from on kept components."""

@@ -425,6 +425,8 @@ def score_traceability(
         "user input", "user requirement", "inferred from input",
         "from dialogue", "dialogue context", "from intent",
         "user request", "inferred", "derived from input",
+        # Self-citation patterns (synthesis/enrichment prompts generate these)
+        "domain invariant", "enrichment", "resynthesis",
     })
 
     has_derived = 0
@@ -437,8 +439,14 @@ def score_traceability(
         if derived and derived.strip():
             has_derived += 1
             d_stripped = derived.strip()
-            # Specificity: >20 chars AND not a known generic phrase
-            if len(d_stripped) > 20 and d_stripped.lower() not in _GENERIC_PHRASES:
+            # Specificity: >20 chars AND not a known generic phrase or prefix
+            is_generic = d_stripped.lower() in _GENERIC_PHRASES
+            if not is_generic:
+                is_generic = any(
+                    d_stripped.lower().startswith(p + ":") or d_stripped.lower().startswith(p + " ")
+                    for p in _GENERIC_PHRASES
+                )
+            if len(d_stripped) > 20 and not is_generic:
                 has_specific += 1
         else:
             missing.append(name)
@@ -860,6 +868,7 @@ def to_verification_dict(det: DeterministicVerification) -> Dict[str, Any]:
         "specificity": _dim_dict(det.specificity),
         "codegen_readiness": _dim_dict(det.codegen_readiness),
         "verification_mode": "deterministic" if not det.needs_llm else "hybrid",
+        "semantic_gates": [],
     }
 
     # Populate legacy fields that _targeted_resynthesis reads

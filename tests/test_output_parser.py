@@ -238,6 +238,49 @@ class TestParseStructuredOutput:
         result = parse_structured_output(text, STAGE_SCHEMAS["synthesis"])
         assert result.success is True
 
+    def test_parse_synthesis_with_semantic_gates(self):
+        text = json.dumps({
+            "components": [{"name": "AuthService", "type": "entity"}],
+            "relationships": [],
+            "semantic_gates": [
+                {
+                    "owner_component": "AuthService",
+                    "question": "AuthService needs provider fallback",
+                    "kind": "gap",
+                    "options": [],
+                    "stage": "verification",
+                }
+            ],
+        })
+        result = parse_structured_output(text, STAGE_SCHEMAS["synthesis"])
+        assert result.success is True
+        assert result.data["semantic_gates"][0]["owner_component"] == "AuthService"
+
+    def test_parse_synthesis_with_semantic_nodes(self):
+        text = json.dumps({
+            "components": [{"name": "AuthService", "type": "entity"}],
+            "relationships": [],
+            "semantic_nodes": [
+                {
+                    "postcode": "STR.ENT.APP.WHAT.SFT",
+                    "primitive": "AuthService",
+                    "description": "Handles authentication",
+                }
+            ],
+        })
+        result = parse_structured_output(text, STAGE_SCHEMAS["synthesis"])
+        assert result.success is True
+        assert result.data["semantic_nodes"][0]["primitive"] == "AuthService"
+
+    def test_parse_synthesis_patch_allows_relationship_only_update(self):
+        text = json.dumps({
+            "relationships": [{"from": "AuthService", "to": "Session", "type": "creates"}],
+            "semantic_nodes": [{"postcode": "EXC.FNC.APP.HOW.SFT", "primitive": "authenticate"}],
+        })
+        result = parse_structured_output(text, STAGE_SCHEMAS["synthesis_patch"])
+        assert result.success is True
+        assert result.data["relationships"][0]["type"] == "creates"
+
     def test_parse_synthesis_no_components(self):
         text = json.dumps({"components": [], "relationships": []})
         result = parse_structured_output(text, STAGE_SCHEMAS["synthesis"])
@@ -252,6 +295,25 @@ class TestParseStructuredOutput:
         })
         result = parse_structured_output(text, STAGE_SCHEMAS["verification"])
         assert result.success is True
+
+    def test_parse_verification_with_semantic_gates(self):
+        text = json.dumps({
+            "status": "needs_work",
+            "completeness": {"score": 72, "gaps": ["Missing provider fallback"]},
+            "coherence": {"score": 81, "issues": []},
+            "semantic_gates": [
+                {
+                    "owner_component": "AuthService",
+                    "question": "Which provider fallback should AuthService use?",
+                    "kind": "semantic_conflict",
+                    "options": ["Anthropic", "OpenAI"],
+                    "stage": "verification",
+                }
+            ],
+        })
+        result = parse_structured_output(text, STAGE_SCHEMAS["verification"])
+        assert result.success is True
+        assert result.data["semantic_gates"][0]["owner_component"] == "AuthService"
 
     def test_parse_personas_array_input(self):
         """Bare array input gets wrapped for personas schema."""
@@ -364,6 +426,7 @@ class TestStageSchemas:
         assert "intent" in STAGE_SCHEMAS
         assert "personas" in STAGE_SCHEMAS
         assert "synthesis" in STAGE_SCHEMAS
+        assert "synthesis_patch" in STAGE_SCHEMAS
         assert "verification" in STAGE_SCHEMAS
 
     def test_personas_allows_array(self):
@@ -377,6 +440,8 @@ class TestStageSchemas:
         comp_field = [f for f in schema.fields if f.name == "components"][0]
         assert comp_field.required is True
         assert comp_field.min_length == 1
+        assert any(f.name == "semantic_gates" for f in schema.fields)
+        assert any(f.name == "semantic_nodes" for f in schema.fields)
 
 
 # =============================================================================

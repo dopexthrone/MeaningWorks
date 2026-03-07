@@ -5,7 +5,7 @@ import { compileAsync, getTaskStatus, cancelTask } from '@/lib/api/compile';
 import { useTaskPolling } from './useTaskPolling';
 import type { CompileRequest, CompileResponse, TaskStatusResponse } from '@/lib/api/types';
 
-export type CompilePhase = 'idle' | 'submitting' | 'queued' | 'polling' | 'complete' | 'error' | 'cancelled';
+export type CompilePhase = 'idle' | 'submitting' | 'queued' | 'polling' | 'awaiting_decision' | 'complete' | 'error' | 'cancelled';
 
 interface UseCompileResult {
   phase: CompilePhase;
@@ -31,6 +31,11 @@ export function useCompile(): UseCompileResult {
     isComplete: useCallback((d: TaskStatusResponse) => {
       if (d.status === 'complete') {
         setPhase('complete');
+        setResult(d.result ?? null);
+        return true;
+      }
+      if (d.status === 'awaiting_decision') {
+        setPhase('awaiting_decision');
         setResult(d.result ?? null);
         return true;
       }
