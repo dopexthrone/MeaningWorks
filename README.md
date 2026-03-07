@@ -1,4 +1,6 @@
-# Motherlabs Semantic Compiler
+# Motherlabs
+
+> Clarity You Can Ship
 
 Motherlabs is a semantic compiler and no-code workbench for turning domain intent into buildable software blueprints.
 
@@ -198,11 +200,6 @@ The export bundle is the renderer handoff. It currently includes:
 - semantic nodes
 - governance and stage data
 - open gaps preserved as explicit context
-
-## Naming Note
-
-Some older internal identifiers and commit history still use legacy names like `MeaningWorks`.
-The public product identity is `Motherlabs`.
 
 ## Repository
 
